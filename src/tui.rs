@@ -921,7 +921,11 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
 fn draw_work(f: &mut Frame, area: Rect, app: &App) {
     let controlled: Vec<&Work> = app.work.iter().filter(|w| w.proc.controlled()).collect();
     let paused = controlled.iter().filter(|w| w.proc.stopped).count();
-    let total: f64 = controlled.iter().map(|w| w.cpu).sum();
+    let total: f64 = controlled
+        .iter()
+        .map(|w| w.cpu.max(0.0))
+        .sum::<f64>()
+        .max(0.0);
     let title = format!(
         "Processes · {} controlled · {paused} paused · {:.0}% CPU",
         controlled.len(),

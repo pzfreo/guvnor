@@ -217,8 +217,8 @@ impl Config {
             "temperature.period must be between 0.2 s and period",
         )?;
         check(
-            t.min < t.max && t.step > 0.0 && t.kp >= 0.0 && t.ki > 0.0,
-            "temperature: need min < max, step > 0, kp >= 0, ki > 0",
+            t.min <= t.max && t.step > 0.0 && t.kp >= 0.0 && t.ki > 0.0,
+            "temperature: need min <= max (equal pins the setpoint), step > 0, kp >= 0, ki > 0",
         )?;
         check(
             t.floor > 0.0 && t.floor <= self.rules.ceiling,
@@ -354,6 +354,9 @@ mod tests {
         assert!(Config::parse("[rules]\nfloor = 0").is_err());
         assert!(Config::parse("[work]\nnames = [\"(\"]").is_err());
         assert!(Config::parse("[work]\nexes = [\"(\"]").is_err());
+        // min = max pins the setpoint; min > max is an error.
+        assert!(Config::parse("[temperature]\nmin = 75\nmax = 75").is_ok());
+        assert!(Config::parse("[temperature]\nmin = 80\nmax = 75").is_err());
         assert!(Config::parse("[work]\nexclude_names = [\"(\"]").is_err());
     }
 
