@@ -165,7 +165,9 @@ impl Controller {
         }
         if r.relearn_every == 0 {
             self.cap = None; // the prototype's behaviour: no learned cap
-        } else {
+        } else if !self.recovering {
+            // Only the first cut of an overshoot says the duty was too high. Later cuts happen while
+            // the fans are still shedding heat from before (or from before the governor started).
             self.cap = Some(
                 self.cap
                     .unwrap_or(1.0)
@@ -318,6 +320,29 @@ mod tests {
             peak <= 2650 && over_high <= 10,
             "peak {peak}, {over_high} periods above HIGH"
         );
+    }
+
+    #[test]
+    fn starting_with_the_fans_at_maximum_does_not_learn_a_cap_from_the_cool_down() {
+        // As on the live trial: started while a heavy load (2.5× a full build here) had the fans
+        // at 7800 rpm. The cuts while they come down reflect old heat, so once at base speed the
+        // duty must probe upward soon rather than wait out relearn_every at the floor.
+        let run = crate::sim::simulate_from(Rules::default(), 120, |_| 2.5, 7800);
+        let down = run
+            .rpms
+            .iter()
+            .position(|&r| r <= 2600)
+            .expect("fans never came down");
+        let rises = run.duties[down..]
+            .iter()
+            .position(|&d| d > 0.2 + 1e-9)
+            .expect("duty never rose");
+        assert!(
+            rises <= 12,
+            "duty held at the floor for {rises} periods at base speed"
+        );
+        let (_, peak) = after(&run, down, 2600);
+        assert!(peak <= 2700, "peak {peak}");
     }
 
     #[test]
