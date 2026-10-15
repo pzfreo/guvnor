@@ -46,6 +46,7 @@ struct SmcParam {
 }
 
 const READ_BYTES: u8 = 5;
+const READ_INDEX: u8 = 8;
 const READ_KEY_INFO: u8 = 9;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -127,6 +128,47 @@ impl Smc {
             _ if p.key_info.data_size == 1 => Some(b[0] as f64),
             _ => None,
         }
+    }
+
+    /// Every key the SMC has, by index (`#KEY` is the count).
+    pub fn keys(&self) -> Vec<[u8; 4]> {
+        let n = self
+            .read(b"#KEY")
+            .map(|p| u32::from_be_bytes([p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3]]))
+            .unwrap_or(0);
+        (0..n)
+            .filter_map(|i| {
+                let input = SmcParam {
+                    data8: READ_INDEX,
+                    data32: i,
+                    ..Default::default()
+                };
+                self.call(&input).map(|p| p.key.to_be_bytes())
+            })
+            .collect()
+    }
+
+    /// The keys matching these names, a trailing `*` matching a prefix, that read as plausible
+    /// temperatures now. Sensors stuck at one value are kept; there is no way to tell yet.
+    pub fn resolve(&self, patterns: &[String]) -> Vec<[u8; 4]> {
+        let all = self.keys();
+        all.into_iter()
+            .filter(|k| {
+                patterns.iter().any(|p| match p.strip_suffix('*') {
+                    Some(pre) => k.starts_with(pre.as_bytes()),
+                    None => &k[..] == p.as_bytes(),
+                })
+            })
+            .filter(|k| self.number(k).is_some_and(|v| v > 5.0 && v < 130.0))
+            .collect()
+    }
+
+    /// The hottest of these sensors, in °C.
+    pub fn hottest(&self, keys: &[[u8; 4]]) -> Option<f64> {
+        keys.iter()
+            .filter_map(|k| self.number(k))
+            .filter(|v| *v > 5.0 && *v < 130.0)
+            .reduce(f64::max)
     }
 
     /// Each fan's (actual, maximum) rpm.

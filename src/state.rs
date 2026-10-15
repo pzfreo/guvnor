@@ -26,7 +26,8 @@ fn write_atomic(name: &str, data: &[u8]) -> std::io::Result<()> {
     let tmp = dir().join(format!(".{name}.{}", std::process::id()));
     let mut f = fs::File::create(&tmp)?;
     f.write_all(data)?;
-    f.sync_data()?;
+    // No fsync: the files only have to outlive the governor, not the machine, and the
+    // temperature loop writes them every second.
     fs::rename(tmp, path)
 }
 
@@ -88,6 +89,17 @@ pub struct Status {
     pub history: Vec<Sample>,
     /// The latest log lines.
     pub events: Vec<String>,
+    /// "temperature" or "fans".
+    #[serde(default)]
+    pub control: String,
+    /// The hottest die sensor and the setpoint the temperature loop holds it at.
+    #[serde(default)]
+    pub temp: Option<f64>,
+    #[serde(default)]
+    pub setpoint: Option<f64>,
+    /// Seconds per duty cycle (the temperature loop's, or the period).
+    #[serde(default)]
+    pub cycle: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -95,6 +107,10 @@ pub struct Sample {
     pub t: f64,
     pub rpm: u32,
     pub duty: f64,
+    #[serde(default)]
+    pub temp: Option<f64>,
+    #[serde(default)]
+    pub setpoint: Option<f64>,
 }
 
 pub fn write_status(s: &Status) {

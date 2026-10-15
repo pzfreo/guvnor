@@ -11,9 +11,57 @@ pub struct Config {
     pub target_rpm: u32,
     /// Seconds per duty cycle: work runs duty × period, then is paused for the rest.
     pub period: f64,
+    /// "temperature": a fast loop holds a CPU die temperature that the fan rules move (default).
+    /// "fans": the prototype, the fan rules setting the duty directly.
+    pub control: Control,
     pub rules: Rules,
+    pub temperature: Temperature,
     pub work: Work,
     pub battery: Option<Battery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Control {
+    Temperature,
+    Fans,
+}
+
+/// The temperature loop (`control = "temperature"`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Temperature {
+    /// SMC sensors, a trailing `*` matching a prefix; the hottest counts. `Tp*`: CPU dies.
+    pub keys: Vec<String>,
+    /// The die temperature (°C) the loop starts by holding; the fan rules then move it.
+    pub start: f64,
+    pub min: f64,
+    pub max: f64,
+    /// °C the fan rules move the setpoint per step (where they moved the duty by points).
+    pub step: f64,
+    /// Seconds per duty cycle. Short, so a heavy build cannot heat the die in one burst.
+    pub period: f64,
+    /// PI gains: duty per °C of error, and duty per °C·s.
+    pub kp: f64,
+    pub ki: f64,
+    /// The duty never goes below this. With a 1 s cycle, 0.05 still runs the work 50 ms a second.
+    pub floor: f64,
+}
+
+impl Default for Temperature {
+    fn default() -> Self {
+        Temperature {
+            keys: vec!["Tp*".into()],
+            start: 75.0,
+            min: 50.0,
+            max: 95.0,
+            step: 1.0,
+            period: 1.0,
+            kp: 0.005,
+            ki: 0.005,
+            floor: 0.05,
+        }
+    }
 }
 
 /// The duty-cycle rules.
@@ -76,7 +124,9 @@ impl Default for Config {
         Config {
             target_rpm: 2500,
             period: 10.0,
+            control: Control::Temperature,
             rules: Rules::default(),
+            temperature: Temperature::default(),
             work: Work::default(),
             battery: None,
         }
@@ -161,6 +211,23 @@ impl Config {
         let r = &self.rules;
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check(self.period >= 1.0, "period must be at least 1 s")?;
+        let t = &self.temperature;
+        check(
+            t.period >= 0.2 && t.period <= self.period,
+            "temperature.period must be between 0.2 s and period",
+        )?;
+        check(
+            t.min < t.max && t.step > 0.0 && t.kp >= 0.0 && t.ki > 0.0,
+            "temperature: need min < max, step > 0, kp >= 0, ki > 0",
+        )?;
+        check(
+            t.floor > 0.0 && t.floor <= self.rules.ceiling,
+            "temperature.floor must be in (0, ceiling]",
+        )?;
+        check(
+            !t.keys.is_empty(),
+            "temperature.keys must name at least one sensor",
+        )?;
         check(
             r.floor > 0.0 && r.floor <= r.ceiling && r.ceiling <= 1.0,
             "need 0 < floor <= ceiling <= 1",

@@ -18,6 +18,10 @@ struct Rig {
 
 impl Rig {
     fn new(name: &str, rules: &str) -> Rig {
+        Rig::with(name, "control = \"fans\"", rules)
+    }
+
+    fn with(name: &str, top: &str, rules: &str) -> Rig {
         let dir = std::env::temp_dir().join(format!("guvnor-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -31,7 +35,7 @@ impl Rig {
         let pattern = format!("^/bin/sleep {}$", secs.replace('.', "\\\\."));
         std::fs::write(
             dir.join("config.toml"),
-            format!("period = {PERIOD}\n[rules]\nfloor = {FLOOR}\n{rules}\n[work]\nnames = []\nexes = []\ncmdlines = [\"{pattern}\"]\n"),
+            format!("period = {PERIOD}\n{top}\n[rules]\nfloor = {FLOOR}\n{rules}\n[work]\nnames = []\nexes = []\ncmdlines = [\"{pattern}\"]\n"),
         )
         .unwrap();
         Rig {
@@ -350,4 +354,33 @@ fn a_changed_config_applies_without_a_restart_and_a_broken_one_is_ignored() {
     rig.wait_for(false, PERIOD + 0.5)
         .expect("victim still paused after reload");
     rig.never_stopped(2.0 * PERIOD);
+}
+
+#[test]
+fn temperature_mode_pauses_briefly_and_a_crash_leaves_nothing_stopped() {
+    // A 1 s cycle with the duty held at or below 0.3: every pause is at most 0.95 s (floor 0.05).
+    let mut rig = Rig::with("temp", "[temperature]\nperiod = 1.0", "ceiling = 0.3");
+    let gov = rig.start();
+    rig.wait_for(true, 6.0)
+        .expect("governor never paused the victim");
+    let (mut longest, mut since) = (0.0f64, Some(Instant::now()));
+    let t = Instant::now();
+    while t.elapsed().as_secs_f64() < 4.0 {
+        match (rig.stopped(), since) {
+            (true, None) => since = Some(Instant::now()),
+            (false, Some(s)) => {
+                longest = longest.max(s.elapsed().as_secs_f64());
+                since = None;
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(longest <= 0.95 + 0.15, "longest pause {longest:.2} s");
+    assert!(rig.log().contains("temperature, holding"), "{}", rig.log());
+    rig.wait_for(true, 2.0).expect("not paused again");
+    unsafe { libc::kill(gov as i32, libc::SIGKILL) };
+    rig.wait_for(false, 1.0)
+        .expect("victim left stopped after the governor was killed");
+    rig.never_stopped(2.0);
 }

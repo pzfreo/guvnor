@@ -11,6 +11,7 @@ mod procs;
 mod sim;
 mod smc;
 mod state;
+mod thermal;
 mod tui;
 mod watchdog;
 
@@ -65,6 +66,7 @@ const USAGE: &str = "usage: guvnor [command]
   uninstall   remove it, continuing all work
   config      print a commented config file with the defaults
   fans        print the fan speeds, as fan.c does
+  keys        print every SMC key with a numeric value (to choose temperature sensors)
 
 config: ~/.config/guvnor/config.toml (or $GUVNOR_CONFIG)";
 
@@ -97,6 +99,75 @@ fn main() {
         Some("fans") => smc::Smc::open()
             .map(|s| println!("{}", smc::describe(&s.fans())))
             .ok_or("cannot open the SMC".into()),
+        Some("keys") => smc::Smc::open()
+            .ok_or("cannot open the SMC".into())
+            .map(|s| {
+                for k in s.keys() {
+                    if let Some(v) = s.number(&k) {
+                        println!("{} {v:.2}", String::from_utf8_lossy(&k));
+                    }
+                }
+            }),
+        // Diagnostic, not in the usage: `guvnor sample <secs> <key or prefix*>...` prints the fastest fan and the
+        // maximum of each key group once a second.
+        Some("sample") => smc::Smc::open()
+            .ok_or("cannot open the SMC".into())
+            .map(|s| {
+                // <secs>[@<interval ms>]
+                let spec = args.get(1).cloned().unwrap_or_default();
+                let (secs, every) = spec.split_once('@').unwrap_or((&spec, "1000"));
+                let secs: u64 = secs.parse().unwrap_or(60);
+                let every: u64 = every.parse().unwrap_or(1000);
+                let all = s.keys();
+                let groups: Vec<(String, Vec<[u8; 4]>)> = args[2..]
+                    .iter()
+                    .map(|g| {
+                        let pre = g.trim_end_matches('*').as_bytes();
+                        let keys = all
+                            .iter()
+                            .filter(|k| {
+                                if g.ends_with('*') {
+                                    k.starts_with(pre)
+                                } else {
+                                    &k[..] == pre
+                                }
+                            })
+                            .copied()
+                            .collect();
+                        (g.clone(), keys)
+                    })
+                    .collect();
+                println!(
+                    "t rpm phase {}",
+                    groups
+                        .iter()
+                        .map(|g| g.0.clone())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let start = std::time::Instant::now();
+                while start.elapsed().as_secs() < secs {
+                    let phase = state::read_status().map(|st| st.phase).unwrap_or_default();
+                    let vals: Vec<String> = groups
+                        .iter()
+                        .map(|(_, ks)| {
+                            let m = ks
+                                .iter()
+                                .filter_map(|k| s.number(k))
+                                .filter(|v| *v > 0.0 && *v < 150.0)
+                                .fold(f64::NAN, f64::max);
+                            format!("{m:.1}")
+                        })
+                        .collect();
+                    println!(
+                        "{:.2} {} {phase} {}",
+                        start.elapsed().as_secs_f64(),
+                        s.rpm(),
+                        vals.join(" ")
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(every));
+                }
+            }),
         Some("watchdog") => match args.get(1).and_then(|p| p.parse().ok()) {
             Some(pid) => watchdog::run(pid),
             None => Err("usage: guvnor watchdog <governor pid>".into()),
@@ -149,7 +220,11 @@ fn status(c: &config::Config) {
             let state = if s.paused {
                 "paused (throttling off)".to_string()
             } else {
-                format!("duty {:.0}%{cap}", s.duty * 100.0)
+                let die = match (s.temp, s.setpoint) {
+                    (Some(t), Some(sp)) => format!(", die {t:.0} °C holding {sp:.0} °C"),
+                    _ => String::new(),
+                };
+                format!("duty {:.0}%{cap}{die}", s.duty * 100.0)
             };
             println!(
                 "governor: running (pid {}), {state}, target {} rpm, period {} s",

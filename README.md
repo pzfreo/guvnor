@@ -64,7 +64,11 @@ running it still shows the fans and the matched processes.
 `~/.config/guvnor/config.toml` (or `$GUVNOR_CONFIG`). Every setting is optional; unknown keys are
 an error. `guvnor config` prints them all with comments. In short:
 
-- `target_rpm` (2500), `period` (10 s).
+- `target_rpm` (2500), `period` (10 s), `control` (`"temperature"`, or `"fans"` for the
+  prototype's loop).
+- `[temperature]`: `keys` (SMC sensors, `*` for a prefix; default `Tp*`, the CPU dies; `guvnor keys`
+  lists them all), `start` (75 °C), `min`/`max` (50–95 °C), `step` (1 °C), `period` (1 s), `kp`/`ki`
+  (0.005), `floor` (0.05).
 - `[rules]`: above `target + limit_above` (2700) duty × 0.7; above `target + high_above` (2600)
   duty × 0.9; fans off (below 2000) +10 points every 3 periods; at base speed +5 points every 6;
   `floor` 0.2, `ceiling` 1.0; `cut_hold` and `relearn_every` (below).
@@ -79,9 +83,37 @@ reloaded`. A config with an error is logged and ignored, and the previous settin
 
 ## The control loop
 
-These rules are the prototype's, which ran for days on a Mac17,7 (M5 Max). These fans are either
-off or at least about 2500 rpm (base speed reads 2500–2599), so a 2500 target means "base speed is
-fine, never higher". The fans also lag heat by tens of seconds.
+These fans are either off or at least about 2500 rpm (base speed reads 2500–2599), so a 2500
+target means "base speed is fine, never higher". They follow heat tens of seconds to minutes late,
+and they react to the **peak** die temperature, not the average load.
+
+### Temperature (the default)
+
+The prototype (`control = "fans"`) set the duty from the fans directly with a 10 s cycle. On a
+heavy parallel build that fails: in each run burst all cores go flat out, the die heats from 55 to
+over 90 °C within 2 s, and the fans spin up even at the 20% floor. Measured on the Mac17,7, a
+2 s burst at 20% duty held the fans at 5000–6000 rpm.
+
+So there are two loops:
+
+- **A fast loop** (every 1 s cycle) reads the hottest CPU die sensor (`Tp*`) at the end of each
+  run phase and adjusts the duty with a PI controller to hold it at a setpoint. Short cycles keep
+  the bursts too brief to heat the die, and the die answers within about a second.
+- **A slow loop** (every 10 s period) applies the prototype's fan rules to the *setpoint* instead
+  of the duty: above LIMIT 4 °C down (and the duty cut by 30% at once), above HIGH 2 °C down, fans
+  off 1 °C up every 3 periods, base speed 1 °C up every 6. It finds the die temperature at which the
+  fans stay at base speed, and follows changes in load and room temperature.
+
+Two details came from live runs. While the fans are falling the slow loop never cuts, even above
+LIMIT: the fast loop already has the die under control, and the fans are only shedding old heat.
+And only the first cut of an overshoot slows the upward probing (doubling the wait, up to 8×).
+
+Live, under another session's heavy build and test load (around 40 work processes), it brought
+the fans from 3576 rpm to base speed in 50 s and held them at 2496–2507 rpm, with the die at
+68–77 °C and a duty of 16–30%. The prototype's loop took about 4 minutes to get down and then
+overshot to 2778 rpm on its next probe. The governor itself used 0.3% CPU.
+
+### Fans (`control = "fans"`, the prototype's)
 
 Simulated against a fan with that lag, the prototype's rules settle into a limit cycle. The duty
 climbs at base speed until the fans pass 2600; then, because the fans keep rising on the heat from
@@ -90,16 +122,20 @@ before the cut, it cuts three or four times in a row and climbs again. That give
 
 - **cut_hold** (4 periods): after a cut, wait before cutting again. Below LIMIT, also only cut
   again if the fans are not already falling.
-- **relearn_every** (30 periods): a cut remembers the duty that overshot, and rises stop one
-  base step below it. After 30 periods there at base speed it tries one step higher. A try that
+- **relearn_every** (30 periods): the first cut of an overshoot remembers the duty, and rises stop
+  one base step below it. After 30 periods there at base speed it tries one step higher. A try that
   overshoots doubles the wait, up to 8× (40 minutes). With the fans off it tries faster.
 
-In the simulation at full load, the new rules hold the fans at about 2580 rpm with the duty steady
-near 60–65%. The only excursions left are the occasional tries, which peak around 2620 rpm.
+### Both
 
-At duty 100% the governor stops nothing and does not even look for work; it only polls the fans.
-Work it finds is moved out of the background band (`taskpolicy -B`), so nothing is left on the
-efficiency cores only.
+At duty 100% nothing is stopped and the governor does not look for work; it only reads the fans
+(and, in temperature mode, the die once a cycle). Work it finds is moved out of the background band
+(`taskpolicy -B`), so nothing is left on the efficiency cores only.
+
+**Why not slow the CPU clock instead?** macOS gives no control of Apple-silicon CPU frequencies,
+per process or otherwise. The only clock-related levers are Low Power Mode (root, the whole machine)
+and background QoS (efficiency cores only), both of which this tool exists to avoid. A 1 s duty
+cycle is the per-process equivalent: the die sees the average power.
 
 ## Crash safety
 
@@ -111,8 +147,9 @@ this:
    separate watchdog process (in its own session, so Ctrl-C and terminal signals don't reach it)
    continues them within a quarter second if the governor exits or is killed. If both are killed,
    the LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor pause`.
-3. **Every pause is bounded**: no longer than `period × (1 − floor)` (8 s by default). If the
-   governor hangs, the watchdog continues the work at that deadline (plus half a second).
+3. **Every pause is bounded**: no longer than `cycle × (1 − floor)`: 0.95 s in temperature mode,
+   8 s with the fan rules. If the governor hangs, the watchdog continues the work at that
+   deadline (plus half a second).
 
 It never pauses itself, its watchdog, its ancestors (your shell and terminal), any `guvnor`,
 another user's process, or a process already stopped by someone else (Ctrl-Z).
@@ -142,10 +179,13 @@ rm -rf ~/.config/guvnor ~/.local/state/guvnor ~/Library/Logs/guvnor.log
 
 ## Tests
 
-`cargo test`: the controller against a simulated lagging fan (it converges at a 2500 target, beats
-the prototype's rules, and follows load changes), the config, the process matcher, and the crash
+`cargo test`: both controllers against simulations. The temperature loop holds a simulated die at
+its setpoint at light to very heavy loads, and keeps a lagging fan at base speed. The fan rules
+converge at a 2500 target, beat the prototype's, and follow load changes. Both cases from the live
+runs (a hot start ratcheting the cap or setpoint down) are covered. Also tested: the config, the process matcher, and the crash
 safety of the real binary. Those tests kill the governor with SIGKILL mid-pause, kill it together
 with its watchdog, hang it with SIGSTOP, stop it with SIGTERM, and use `pause`/`resume`, checking
-each time that no process stays stopped. They throttle only their own `sleep` processes.
+each time that no process stays stopped, in both modes. They throttle only their own `sleep`
+processes. Stop a running governor before `cargo test`: it would throttle the tests too.
 
 `reference/` holds the prototype (`fan.c`, `fangov.py`) this was ported from.

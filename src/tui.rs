@@ -110,6 +110,8 @@ impl App {
                 t: now,
                 rpm: self.rpm(),
                 duty: 1.0,
+                temp: None,
+                setpoint: None,
             });
         }
     }
@@ -465,9 +467,11 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
             .use_unicode(true),
         gauge,
     );
-    let cap_text = match s.cap {
-        Some(c) => format!("learned cap {:.0}%", c * 100.0),
-        None => "no cap learned".into(),
+    let cap_text = match (s.temp, s.setpoint, s.cap) {
+        (Some(t), Some(sp), _) => format!("die {t:.0} °C, holding {sp:.0} °C · {} s cycle", s.cycle),
+        (_, Some(sp), _) => format!("holding {sp:.0} °C · {} s cycle", s.cycle),
+        (_, _, Some(c)) => format!("learned cap {:.0}%", c * 100.0),
+        _ => "no cap learned".into(),
     };
     f.render_widget(
         Line::from(vec![
