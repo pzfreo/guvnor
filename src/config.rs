@@ -1,4 +1,4 @@
-//! `~/.config/fangov/config.toml`. Every setting is optional; the defaults are the prototype's.
+//! `~/.config/guvnor/config.toml`. Every setting is optional; the defaults are the prototype's.
 
 use crate::power::Power;
 use serde::Deserialize;
@@ -50,6 +50,8 @@ pub struct Rules {
 pub struct Work {
     /// Regexes matched against the whole process name (like `pgrep -x`).
     pub names: Vec<String>,
+    /// Regexes searched for in the executable's path, as it was run.
+    pub exes: Vec<String>,
     /// Regexes searched for in the full command line (like `pgrep -f`).
     pub cmdlines: Vec<String>,
     /// A process whose whole name matches is work, and so are all its descendants.
@@ -114,7 +116,8 @@ impl Default for Work {
                 "cargo-clippy",
                 "clippy-driver",
             ]),
-            cmdlines: s(&["target/(release|debug)/"]),
+            exes: s(&["target/(release|debug)/"]),
+            cmdlines: vec![],
             tree_names: vec![],
             tree_cmdlines: vec![],
         }
@@ -132,10 +135,10 @@ impl Default for Battery {
 }
 
 pub fn default_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("FANGOV_CONFIG") {
+    if let Some(p) = std::env::var_os("GUVNOR_CONFIG") {
         return p.into();
     }
-    crate::home().join(".config/fangov/config.toml")
+    crate::home().join(".config/guvnor/config.toml")
 }
 
 impl Config {
@@ -213,7 +216,7 @@ impl Config {
     }
 }
 
-pub const SAMPLE: &str = r#"# fangov configuration. Every setting is optional; these are the defaults.
+pub const SAMPLE: &str = r#"# guvnor configuration. Every setting is optional; these are the defaults.
 
 target_rpm = 2500     # keep the fastest fan at or below this (base speed counts as within it)
 period = 10           # seconds per duty cycle: work runs duty × period, then is paused
@@ -238,8 +241,11 @@ relearn_every = 30    # rises stop just below the duty that last overshot; after
 [work]
 # Regexes on the whole process name (like pgrep -x).
 names = ["rustc", "cargo", "ld", "clang", "cc", "cargo-clippy", "clippy-driver"]
-# Regexes searched for in the full command line (like pgrep -f).
-cmdlines = ["target/(release|debug)/"]
+# Regexes searched for in the executable's path: built programs and test binaries.
+exes = ["target/(release|debug)/"]
+# Regexes searched for in the full command line (like pgrep -f). This also catches shells and
+# scripts that merely mention a path, so prefer exes.
+cmdlines = []
 # A process matching these, and all its descendants, is work.
 tree_names = []
 tree_cmdlines = []

@@ -1,10 +1,10 @@
-//! `fangov install` / `uninstall`: a per-user LaunchAgent with KeepAlive.
+//! `guvnor install` / `uninstall`: a per-user LaunchAgent with KeepAlive.
 
 use crate::config::Config;
 use std::path::PathBuf;
 use std::process::Command;
 
-const LABEL: &str = "local.fangov";
+const LABEL: &str = "local.guvnor";
 
 fn plist_path() -> PathBuf {
     crate::home().join(format!("Library/LaunchAgents/{LABEL}.plist"))
@@ -31,9 +31,9 @@ pub fn install() -> Result<(), String> {
         );
         eprintln!("         `cargo install --path .` puts it in ~/.cargo/bin instead.");
     }
-    let log = crate::home().join("Library/Logs/fangov.log");
+    let log = crate::home().join("Library/Logs/guvnor.log");
     // A non-default config or state directory set now is pinned into the agent.
-    let env: String = ["FANGOV_CONFIG", "FANGOV_STATE"]
+    let env: String = ["GUVNOR_CONFIG", "GUVNOR_STATE"]
         .iter()
         .filter_map(|k| {
             std::env::var(k)

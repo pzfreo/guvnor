@@ -12,6 +12,8 @@ pub struct Proc {
     pub name: String,
     pub stopped: bool,
     zombie: bool,
+    /// Why it counts as work: "name", "exe", "cmdline" or "tree".
+    pub reason: &'static str,
 }
 
 fn c_str(bytes: &[libc::c_char]) -> String {
@@ -51,6 +53,7 @@ pub fn info(pid: i32) -> Option<Proc> {
         name,
         stopped: bi.pbi_status == libc::SSTOP,
         zombie: bi.pbi_status == 5, // SZOMB
+        reason: "",
     })
 }
 
@@ -74,8 +77,9 @@ pub fn all() -> Vec<Proc> {
         .collect()
 }
 
-/// The command line, arguments joined by spaces, as `pgrep -f` sees it.
-pub fn cmdline(pid: i32) -> Option<String> {
+/// The executable path as it was run, and the command line (arguments joined by spaces, as
+/// `pgrep -f` sees it).
+pub fn args(pid: i32) -> Option<(String, String)> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut buf = vec![0u8; 256 * 1024];
     let mut size = buf.len();
@@ -97,6 +101,7 @@ pub fn cmdline(pid: i32) -> Option<String> {
     // After argc: the executable path, NUL padding, then argv.
     let mut rest = &buf[4..];
     let path_end = rest.iter().position(|&b| b == 0)?;
+    let exe = String::from_utf8_lossy(&rest[..path_end]).into_owned();
     rest = &rest[path_end..];
     let start = rest.iter().position(|&b| b != 0)?;
     let args: Vec<String> = rest[start..]
@@ -104,7 +109,7 @@ pub fn cmdline(pid: i32) -> Option<String> {
         .take(argc)
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
-    Some(args.join(" "))
+    Some((exe, args.join(" ")))
 }
 
 fn any_of(patterns: &[String], whole: bool) -> Option<Regex> {
@@ -118,6 +123,7 @@ fn any_of(patterns: &[String], whole: bool) -> Option<Regex> {
 
 pub struct Matcher {
     names: Option<Regex>,
+    exes: Option<Regex>,
     cmdlines: Option<Regex>,
     tree_names: Option<Regex>,
     tree_cmdlines: Option<Regex>,
@@ -127,6 +133,7 @@ impl Matcher {
     pub fn new(w: &Work) -> Matcher {
         Matcher {
             names: any_of(&w.names, true),
+            exes: any_of(&w.exes, false),
             cmdlines: any_of(&w.cmdlines, false),
             tree_names: any_of(&w.tree_names, true),
             tree_cmdlines: any_of(&w.tree_cmdlines, false),
@@ -134,13 +141,13 @@ impl Matcher {
     }
 
     /// The current user's work processes. Never this process, its ancestors (the shell and
-    /// terminal), its descendants (the watchdog), any other fangov, or other users' processes.
+    /// terminal), its descendants (the watchdog), any other guvnor, or other users' processes.
     pub fn find(&self) -> Vec<Proc> {
         self.find_in(
             all(),
             std::process::id() as i32,
             unsafe { libc::getuid() },
-            cmdline,
+            args,
         )
     }
 
@@ -149,7 +156,7 @@ impl Matcher {
         procs: Vec<Proc>,
         me: i32,
         uid: u32,
-        cmdline: impl Fn(i32) -> Option<String>,
+        args: impl Fn(i32) -> Option<(String, String)>,
     ) -> Vec<Proc> {
         let by_pid: HashMap<i32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
         let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -189,38 +196,79 @@ impl Matcher {
                     && !p.zombie
                     && p.pid > 1
                     && !protected.contains(&p.pid)
-                    && p.name != "fangov"
+                    && p.name != "guvnor"
             })
             .collect();
-        let want_cmdline = self.cmdlines.is_some() || self.tree_cmdlines.is_some();
-        let mut work = HashSet::new();
+        let want_args =
+            self.exes.is_some() || self.cmdlines.is_some() || self.tree_cmdlines.is_some();
+        let mut work: HashMap<i32, &'static str> = HashMap::new();
         let mut roots = vec![];
         for p in &candidates {
-            let line = if want_cmdline {
-                cmdline(p.pid).unwrap_or_default()
+            let (exe, line) = if want_args {
+                args(p.pid).unwrap_or_default()
             } else {
-                String::new()
+                Default::default()
             };
-            let hit = |name: &Option<Regex>, cmd: &Option<Regex>| {
-                name.as_ref().is_some_and(|r| r.is_match(&p.name))
-                    || cmd.as_ref().is_some_and(|r| r.is_match(&line))
+            let is = |r: &Option<Regex>, s: &str| r.as_ref().is_some_and(|r| r.is_match(s));
+            let reason = if is(&self.names, &p.name) {
+                Some("name")
+            } else if is(&self.exes, &exe) {
+                Some("exe")
+            } else if is(&self.cmdlines, &line) {
+                Some("cmdline")
+            } else {
+                None
             };
-            if hit(&self.names, &self.cmdlines) {
-                work.insert(p.pid);
+            if let Some(r) = reason {
+                work.insert(p.pid, r);
             }
-            if hit(&self.tree_names, &self.tree_cmdlines) {
+            if is(&self.tree_names, &p.name) || is(&self.tree_cmdlines, &line) {
                 roots.push(p.pid);
             }
         }
-        work.extend(descendants(&mut roots));
+        for pid in descendants(&mut roots) {
+            work.entry(pid).or_insert("tree");
+        }
         let mut out: Vec<Proc> = candidates
             .into_iter()
-            .filter(|p| work.contains(&p.pid))
-            .cloned()
+            .filter_map(|p| {
+                work.get(&p.pid).map(|&reason| Proc {
+                    reason,
+                    ..p.clone()
+                })
+            })
             .collect();
         out.sort_by_key(|p| p.pid);
         out
     }
+}
+
+/// Total CPU time used, in nanoseconds.
+#[allow(deprecated)] // libc's mach_timebase_info is fine; mach2 would be a dependency for one call
+pub fn cpu_ns(pid: i32) -> Option<u64> {
+    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_taskinfo>() as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut ti as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    // Mach time units; on Apple silicon 1 unit is 125/3 ns.
+    let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+    unsafe { libc::mach_timebase_info(&mut tb) };
+    let t = ti.pti_total_user + ti.pti_total_system;
+    Some(if tb.denom == 0 {
+        t
+    } else {
+        (t as u128 * tb.numer as u128 / tb.denom as u128) as u64
+    })
 }
 
 /// Sends a signal; a process that has gone is not an error.
@@ -253,6 +301,7 @@ mod tests {
             name: name.into(),
             stopped: false,
             zombie: false,
+            reason: "",
         }
     }
 
@@ -262,12 +311,13 @@ mod tests {
             p(1, 0, 0, "launchd"),
             p(10, 1, 501, "Terminal"),
             p(11, 10, 501, "zsh"),
-            p(12, 11, 501, "fangov"), // me
-            p(13, 12, 501, "fangov"), // my watchdog
+            p(12, 11, 501, "guvnor"), // me
+            p(13, 12, 501, "guvnor"), // my watchdog
             p(20, 11, 501, "cargo"),  // work by name
             p(21, 20, 501, "rustc"),
             p(22, 20, 501, "build-script"), // not matched by name
-            p(23, 11, 501, "test-bin"),     // matched by command line
+            p(23, 11, 501, "test-bin"),     // matched by executable path
+            p(25, 11, 501, "zsh"),          // only mentions target/ in its arguments
             p(24, 1, 0, "rustc"),           // another user's
             p(30, 11, 501, "make"),         // a tree root
             p(31, 30, 501, "sh"),
@@ -279,19 +329,31 @@ mod tests {
             ..Work::default()
         };
         let m = Matcher::new(&w);
-        let cmd = |pid| {
-            Some(if pid == 23 {
-                "/x/target/debug/deps/test-bin --exact".into()
-            } else {
-                String::new()
-            })
+        let args = |pid| {
+            let (exe, line) = match pid {
+                23 => (
+                    "/x/target/debug/deps/test-bin",
+                    "/x/target/debug/deps/test-bin --exact",
+                ),
+                25 => ("/bin/zsh", "/bin/zsh -c ./target/release/app"),
+                _ => ("", ""),
+            };
+            Some((exe.to_string(), line.to_string()))
         };
-        let found: Vec<i32> = m
-            .find_in(procs, 12, 501, cmd)
+        let found: Vec<(i32, &str)> = m
+            .find_in(procs, 12, 501, args)
             .iter()
-            .map(|p| p.pid)
+            .map(|p| (p.pid, p.reason))
             .collect();
-        assert_eq!(found, vec![20, 21, 23, 30, 31, 32]);
+        let want = [
+            (20, "name"),
+            (21, "name"),
+            (23, "exe"),
+            (30, "tree"),
+            (31, "tree"),
+            (32, "tree"),
+        ];
+        assert_eq!(found, want);
     }
 
     #[test]
@@ -300,7 +362,7 @@ mod tests {
         let procs = vec![
             p(11, 1, 501, "zsh"),
             p(20, 11, 501, "cargo"),
-            p(21, 20, 501, "fangov"),
+            p(21, 20, 501, "guvnor"),
         ];
         let found = Matcher::new(&Work::default()).find_in(procs, 21, 501, |_| None);
         assert!(found.is_empty());
@@ -310,6 +372,8 @@ mod tests {
     fn reads_this_process() {
         let me = info(std::process::id() as i32).unwrap();
         assert!(!me.stopped);
-        assert!(cmdline(me.pid).unwrap().contains("fangov"));
+        let (exe, line) = args(me.pid).unwrap();
+        assert!(exe.contains("guvnor") && line.contains("guvnor"));
+        assert!(cpu_ns(me.pid).unwrap() > 0);
     }
 }

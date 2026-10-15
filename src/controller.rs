@@ -69,6 +69,15 @@ impl Controller {
         }
     }
 
+    /// New rules from a reloaded config; the duty and what was learned carry over.
+    pub fn set_rules(&mut self, rules: Rules) {
+        self.duty = self.duty.clamp(rules.floor, rules.ceiling);
+        if rules.relearn_every == 0 {
+            self.cap = None;
+        }
+        self.rules = rules;
+    }
+
     pub fn duty(&self) -> f64 {
         self.duty
     }

@@ -1,4 +1,4 @@
-//! Files shared by the governor, its watchdog and the CLI, in `~/.local/state/fangov`.
+//! Files shared by the governor, its watchdog and the CLI, in `~/.local/state/guvnor`.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -7,9 +7,9 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 pub fn dir() -> PathBuf {
-    let d = std::env::var_os("FANGOV_STATE")
+    let d = std::env::var_os("GUVNOR_STATE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::home().join(".local/state/fangov"));
+        .unwrap_or_else(|| crate::home().join(".local/state/guvnor"));
     let _ = fs::create_dir_all(&d);
     d
 }
@@ -31,7 +31,7 @@ fn write_atomic(name: &str, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// The processes the governor has paused, written before it pauses them. If the governor dies,
-/// its watchdog, a restarted governor or `fangov status`/`pause` resume them from this file.
+/// its watchdog, a restarted governor or `guvnor status`/`pause` resume them from this file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stopped {
     pub governor: i32,
@@ -68,7 +68,7 @@ pub fn release_stopped() -> usize {
     }
 }
 
-/// What the running governor last saw, for `fangov status`.
+/// What the running governor last saw, for `guvnor status`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
     pub pid: i32,
@@ -80,17 +80,32 @@ pub struct Status {
     pub ceiling: f64,
     pub period: f64,
     pub paused: bool,
+    /// "run" or "pause" within a throttled period; "full" at 100 % duty; "off" when paused.
+    pub phase: String,
+    /// When the current phase ends.
+    pub phase_end: f64,
+    /// One sample per period, the last hour or so.
+    pub history: Vec<Sample>,
+    /// The latest log lines.
+    pub events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Sample {
+    pub t: f64,
+    pub rpm: u32,
+    pub duty: f64,
 }
 
 pub fn write_status(s: &Status) {
-    let _ = write_atomic("status.json", &serde_json::to_vec_pretty(s).unwrap());
+    let _ = write_atomic("status.json", &serde_json::to_vec(s).unwrap());
 }
 
 pub fn read_status() -> Option<Status> {
     serde_json::from_slice(&fs::read(dir().join("status.json")).ok()?).ok()
 }
 
-/// Throttling is off while this file exists (`fangov pause`); it survives restarts.
+/// Throttling is off while this file exists (`guvnor pause`); it survives restarts.
 pub fn paused() -> bool {
     dir().join("paused").exists()
 }
@@ -123,7 +138,7 @@ pub fn lock() -> Result<fs::File, String> {
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let pid = fs::read_to_string(&path).unwrap_or_default();
         return Err(format!(
-            "another fangov is already running (pid {})",
+            "another guvnor is already running (pid {})",
             pid.trim()
         ));
     }

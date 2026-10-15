@@ -1,4 +1,4 @@
-# fangov
+# guvnor
 
 Keeps a Mac's fans at or below a target speed (say 2500 rpm) while heavy background work —
 builds, tests, renders — uses as much CPU as that allows. It throttles only the work processes,
@@ -7,54 +7,75 @@ SIGSTOP for the rest, and the duty follows the fans.
 
 ## How it differs
 
-- **App Tamer** throttles per app to a CPU percentage you choose. fangov chooses the amount
+- **App Tamer** throttles per app to a CPU percentage you choose. guvnor chooses the amount
   itself, from the fans, and finds short-lived build processes as they appear.
 - **TG Pro / Macs Fan Control** set fan speeds or curves. They make the fans louder or quieter for
-  the same heat; fangov makes less heat.
-- **Low Power Mode** slows everything, including what you are using. fangov leaves the rest of the
+  the same heat; guvnor makes less heat.
+- **Low Power Mode** slows everything, including what you are using. guvnor leaves the rest of the
   machine at full speed, and the work runs at normal priority on all cores (performance and
   efficiency) whenever it runs.
 
 ## Install
 
 ```sh
-cargo install --path .        # puts fangov in ~/.cargo/bin
-fangov config > ~/.config/fangov/config.toml   # optional: the defaults, commented
-fangov run                    # try it in the foreground first; Ctrl-C continues all work
-fangov install                # then run it as a per-user LaunchAgent (KeepAlive)
+cargo install --path .        # puts guvnor in ~/.cargo/bin
+guvnor config > ~/.config/guvnor/config.toml   # optional: the defaults, commented
+guvnor run                    # try it in the foreground first; Ctrl-C continues all work
+guvnor install                # then run it as a per-user LaunchAgent (KeepAlive)
+guvnor                        # watch it: the live dashboard
 ```
 
-The LaunchAgent logs to `~/Library/Logs/fangov.log`. Needs no root: it reads the SMC through
+The LaunchAgent logs to `~/Library/Logs/guvnor.log`. Needs no root: it reads the SMC through
 IOKit and only signals your own processes.
+
+## The dashboard
+
+Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or scripted, it prints
+`status` instead. It shows:
+
+- each fan spinning at a speed that follows its rpm, on a bar with the target marked, coloured by
+  zone: off, base, high, LIMIT;
+- the duty, the learned cap and the ceiling, and where the current period is: work running or
+  paused, with a countdown;
+- the fan speed and the duty over the last hour (starting at 5 minutes and widening as history
+  builds), with the target, HIGH and LIMIT lines;
+- the work processes, each running or paused, with its CPU use and why it matched;
+- the governor's recent events, coloured.
+
+Keys: `p` pauses or resumes throttling, `+` / `-` move the target by 100 rpm (saved to the config,
+keeping its comments; the governor applies it within a period), `q` quits. With no governor
+running it still shows the fans and the matched processes.
 
 ## Commands
 
 | command | |
 |---|---|
-| `fangov run` | run in the foreground, logging each duty change with the rpm |
-| `fangov status` | the governor's duty, the fans, the power source, the matched processes |
-| `fangov pause` | throttling off and every work process continued, until `resume` (survives restarts) |
-| `fangov resume` | throttling on |
-| `fangov install` / `uninstall` | add / remove the LaunchAgent |
-| `fangov config` | print the default config |
-| `fangov fans` | print the fans, e.g. `fan0 2312/7826 fan1 2495/7826` |
+| `guvnor` | the live dashboard |
+| `guvnor run` | run in the foreground, logging each duty change with the rpm |
+| `guvnor status` | the governor's duty, the fans, the power source, the matched processes |
+| `guvnor pause` | throttling off and every work process continued, until `resume` (survives restarts) |
+| `guvnor resume` | throttling on |
+| `guvnor install` / `uninstall` | add / remove the LaunchAgent |
+| `guvnor config` | print the default config |
+| `guvnor fans` | print the fans, e.g. `fan0 2312/7826 fan1 2495/7826` |
 
 ## Configuration
 
-`~/.config/fangov/config.toml` (or `$FANGOV_CONFIG`). Every setting is optional; unknown keys are
-an error. `fangov config` prints them all with comments. In short:
+`~/.config/guvnor/config.toml` (or `$GUVNOR_CONFIG`). Every setting is optional; unknown keys are
+an error. `guvnor config` prints them all with comments. In short:
 
 - `target_rpm` (2500), `period` (10 s).
 - `[rules]`: above `target + limit_above` (2700) duty × 0.7; above `target + high_above` (2600)
   duty × 0.9; fans off (below 2000) +10 points every 3 periods; at base speed +5 points every 6;
   `floor` 0.2, `ceiling` 1.0; `cut_hold` and `relearn_every` (below).
-- `[work]`: `names` (whole process name, like `pgrep -x`; default the Rust/C toolchain), `cmdlines`
-  (command-line search, like `pgrep -f`; default `target/(release|debug)/`), and `tree_names` /
-  `tree_cmdlines` (that process and all its descendants).
+- `[work]`: `names` (whole process name, like `pgrep -x`; default the Rust/C toolchain), `exes`
+  (search in the executable's path; default `target/(release|debug)/`, i.e. built programs and test
+  binaries), `cmdlines` (search in the whole command line, like `pgrep -f`; empty by default), and
+  `tree_names` / `tree_cmdlines` (that process and all its descendants).
 - `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
 
-The governor reads the config at start; restart it after a change (`launchctl kickstart -k
-gui/$(id -u)/local.fangov` for the LaunchAgent).
+The governor notices a changed config at the next period and applies it, logging `config
+reloaded`. A config with an error is logged and ignored, and the previous settings stay.
 
 ## The control loop
 
@@ -86,35 +107,37 @@ If the governor died during a pause, the work would stay stopped for good. Three
 this:
 
 1. **On start** it continues every matching process, and everything the last governor recorded.
-2. **It records every pause** in `~/.local/state/fangov/stopped.json` before sending SIGSTOP. A
+2. **It records every pause** in `~/.local/state/guvnor/stopped.json` before sending SIGSTOP. A
    separate watchdog process (in its own session, so Ctrl-C and terminal signals don't reach it)
    continues them within a quarter second if the governor exits or is killed. If both are killed,
-   the LaunchAgent's restart continues them, and so does `fangov status` or `fangov pause`.
+   the LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor pause`.
 3. **Every pause is bounded**: no longer than `period × (1 − floor)` (8 s by default). If the
    governor hangs, the watchdog continues the work at that deadline (plus half a second).
 
-It never pauses itself, its watchdog, its ancestors (your shell and terminal), any `fangov`,
+It never pauses itself, its watchdog, its ancestors (your shell and terminal), any `guvnor`,
 another user's process, or a process already stopped by someone else (Ctrl-Z).
 
 ## Risks
 
 - **Throttled work takes longer in wall-clock time.** Tests with wall-time timeouts can fail, and
   timing benchmarks are meaningless while throttled. Measure work in instructions retired
-  (`/usr/bin/time -l`), not wall time, or `fangov pause` first.
-- **Matching is by name and command line.** The default `target/(release|debug)/` pattern matches
-  any of your processes with that in its command line, including a shell running such a command.
-  Pausing a waiting shell is harmless. Check `fangov status` after changing the matchers.
+  (`/usr/bin/time -l`), not wall time, or `guvnor pause` first.
+- **Matching is by name and path.** Every build and test binary of yours is throttled, including
+  ones another session or tool started. The dashboard and `guvnor status` list what matches and
+  why. The prototype's `pgrep -f` matching (still available as `cmdlines`) also caught shells and
+  scripts that merely mention a `target/` path; the default now matches the executable's path
+  only.
 - **A process paused mid-network-exchange** can time out at the other end, as with any SIGSTOP.
 - If both the governor and its watchdog are killed while no LaunchAgent is installed (a
-  foreground `fangov run`), work stays paused until you run `fangov status`, `fangov pause` or
-  `fangov run`, or `kill -CONT` it.
+  foreground `guvnor run`), work stays paused until you run `guvnor status`, `guvnor pause` or
+  `guvnor run`, or `kill -CONT` it.
 
 ## Uninstall
 
 ```sh
-fangov uninstall          # stops the agent (it continues all work) and removes the plist
-cargo uninstall fangov
-rm -rf ~/.config/fangov ~/.local/state/fangov ~/Library/Logs/fangov.log
+guvnor uninstall          # stops the agent (it continues all work) and removes the plist
+cargo uninstall guvnor
+rm -rf ~/.config/guvnor ~/.local/state/guvnor ~/Library/Logs/guvnor.log
 ```
 
 ## Tests

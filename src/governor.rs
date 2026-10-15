@@ -1,20 +1,25 @@
-//! `fangov run`: the control loop.
+//! `guvnor run`: the control loop.
 
 use crate::config::Config;
 use crate::controller::Controller;
 use crate::power::Power;
 use crate::procs::{self, Matcher};
 use crate::smc::Smc;
-use crate::{log, state, watchdog};
-use std::collections::HashSet;
+use crate::state::{self, Sample};
+use crate::{log, watchdog};
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
+
+/// Samples kept for `guvnor tui`: an hour at the default period.
+const HISTORY: usize = 360;
 
 /// Sleeps in short slices; returns false early when asked to exit or when paused.
 fn nap(secs: f64) -> bool {
@@ -44,10 +49,47 @@ fn continue_all(matcher: &Matcher) -> usize {
     n.max(work.len())
 }
 
-pub fn run(config: Config) -> Result<(), String> {
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// What the loop publishes for `guvnor status` and `guvnor tui`.
+struct Publisher {
+    history: VecDeque<Sample>,
+}
+
+impl Publisher {
+    fn write(
+        &self,
+        ctl: &Controller,
+        cfg: &Config,
+        (rpm, target, ceiling): (u32, u32, f64),
+        phase: &str,
+        secs: f64,
+    ) {
+        state::write_status(&state::Status {
+            pid: std::process::id() as i32,
+            updated: state::now(),
+            rpm,
+            duty: ctl.duty(),
+            cap: ctl.cap(),
+            target,
+            ceiling,
+            period: cfg.period,
+            paused: phase == "off",
+            phase: phase.into(),
+            phase_end: state::now() + secs,
+            history: self.history.iter().copied().collect(),
+            events: crate::recent_events(),
+        });
+    }
+}
+
+pub fn run(path: PathBuf) -> Result<(), String> {
+    let mut config = Config::load(&path)?;
     let _lock = state::lock()?;
     let smc = Smc::open().ok_or("cannot open the SMC (AppleSMC)")?;
-    let matcher = Matcher::new(&config.work);
+    let mut matcher = Matcher::new(&config.work);
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
@@ -57,17 +99,20 @@ pub fn run(config: Config) -> Result<(), String> {
     let n = continue_all(&matcher);
     let mut dog = watchdog::spawn().map_err(|e| format!("cannot start the watchdog: {e}"))?;
 
-    let period = config.period;
-    let floor = config.rules.floor;
     let mut power = Power::current();
     let (mut target, mut ceiling) = config.effective(power);
     let rpm = smc.rpm();
     let mut ctl = Controller::new(config.rules.clone(), rpm, ceiling);
     let mut was_paused = state::paused();
     let mut seen: HashSet<i32> = HashSet::new();
+    let mut mtime = modified(&path);
+    let mut out = Publisher {
+        history: VecDeque::new(),
+    };
     log(&format!(
-        "start: fan {rpm} rpm, target {target} rpm, duty {} of each {period} s, all cores; continued {n} work processes{}",
+        "start: fan {rpm} rpm, target {target} rpm, duty {} of each {} s, all cores; continued {n} work processes{}",
         pct(ctl.duty()),
+        config.period,
         if was_paused { "; paused" } else { "" }
     ));
 
@@ -75,6 +120,26 @@ pub fn run(config: Config) -> Result<(), String> {
         if let Ok(Some(_)) = dog.try_wait() {
             log("watchdog exited; restarting it");
             dog = watchdog::spawn().map_err(|e| format!("cannot restart the watchdog: {e}"))?;
+        }
+        // A changed config applies from this period on; a broken one is reported and ignored.
+        let now_mtime = modified(&path);
+        if now_mtime != mtime {
+            mtime = now_mtime;
+            match Config::load(&path) {
+                Ok(c) if c == config => {}
+                Ok(c) => {
+                    config = c;
+                    matcher = Matcher::new(&config.work);
+                    ctl.set_rules(config.rules.clone());
+                    (target, ceiling) = config.effective(power);
+                    log(&format!(
+                        "config reloaded: target {target} rpm, period {} s, ceiling {}",
+                        config.period,
+                        pct(ceiling)
+                    ));
+                }
+                Err(e) => log(&format!("config error, keeping the previous settings: {e}")),
+            }
         }
         let paused = state::paused();
         if paused != was_paused {
@@ -106,19 +171,25 @@ pub fn run(config: Config) -> Result<(), String> {
             ));
         }
         let duty = ctl.duty();
-        state::write_status(&state::Status {
-            pid: std::process::id() as i32,
-            updated: state::now(),
+        let period = config.period;
+        if out.history.len() >= HISTORY {
+            out.history.pop_front();
+        }
+        out.history.push_back(Sample {
+            t: state::now(),
             rpm,
-            duty,
-            cap: ctl.cap(),
-            target,
-            ceiling,
-            period,
-            paused,
+            duty: if paused { 1.0 } else { duty },
         });
+
         // At full duty, or paused, nothing is stopped: only the fans are polled.
         if paused || duty >= 1.0 - 1e-9 {
+            out.write(
+                &ctl,
+                &config,
+                (rpm, target, ceiling),
+                if paused { "off" } else { "full" },
+                period,
+            );
             let end = Instant::now() + Duration::from_secs_f64(period);
             while Instant::now() < end && !STOP.load(Ordering::SeqCst) && state::paused() == paused
             {
@@ -128,6 +199,7 @@ pub fn run(config: Config) -> Result<(), String> {
         }
 
         // Run for duty × period. Work found now is moved out of the background band.
+        out.write(&ctl, &config, (rpm, target, ceiling), "run", duty * period);
         let work = matcher.find();
         seen.retain(|pid| work.iter().any(|p| p.pid == *pid));
         for p in &work {
@@ -145,6 +217,7 @@ pub fn run(config: Config) -> Result<(), String> {
         // Pause for the rest. Builds spawn short-lived processes, so look again. A process
         // already stopped by someone else (Ctrl-Z) is left alone, so it is not resumed later.
         let pause = period * (1.0 - duty);
+        out.write(&ctl, &config, (rpm, target, ceiling), "pause", pause);
         let pids: Vec<i32> = matcher
             .find()
             .into_iter()
@@ -157,7 +230,7 @@ pub fn run(config: Config) -> Result<(), String> {
         }
         let stopped = state::Stopped {
             governor: std::process::id() as i32,
-            deadline: state::now() + pause.min(period * (1.0 - floor)),
+            deadline: state::now() + pause.min(period * (1.0 - config.rules.floor)),
             pids: pids.clone(),
         };
         if let Err(e) = state::write_stopped(&stopped) {

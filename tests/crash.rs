@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_fangov");
+const BIN: &str = env!("CARGO_BIN_EXE_guvnor");
 const PERIOD: f64 = 2.0;
 const FLOOR: f64 = 0.2;
 
@@ -18,7 +18,7 @@ struct Rig {
 
 impl Rig {
     fn new(name: &str, rules: &str) -> Rig {
-        let dir = std::env::temp_dir().join(format!("fangov-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("guvnor-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A unique duration makes a unique command line.
@@ -31,7 +31,7 @@ impl Rig {
         let pattern = format!("^/bin/sleep {}$", secs.replace('.', "\\\\."));
         std::fs::write(
             dir.join("config.toml"),
-            format!("period = {PERIOD}\n[rules]\nfloor = {FLOOR}\n{rules}\n[work]\nnames = []\ncmdlines = [\"{pattern}\"]\n"),
+            format!("period = {PERIOD}\n[rules]\nfloor = {FLOOR}\n{rules}\n[work]\nnames = []\nexes = []\ncmdlines = [\"{pattern}\"]\n"),
         )
         .unwrap();
         Rig {
@@ -44,8 +44,8 @@ impl Rig {
     fn cmd(&self, arg: &str) -> Command {
         let mut c = Command::new(BIN);
         c.arg(arg)
-            .env("FANGOV_STATE", &self.dir)
-            .env("FANGOV_CONFIG", self.dir.join("config.toml"));
+            .env("GUVNOR_STATE", &self.dir)
+            .env("GUVNOR_CONFIG", self.dir.join("config.toml"));
         c
     }
 
@@ -160,7 +160,7 @@ fn sigkill_of_governor_and_watchdog_is_recovered_by_status_or_restart() {
     }
     std::thread::sleep(Duration::from_millis(500));
     assert!(rig.stopped(), "with both killed nothing has resumed it yet");
-    // `fangov status` resumes what a dead governor left paused.
+    // `guvnor status` resumes what a dead governor left paused.
     let out = rig.cmd("status").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("continued 1 processes"));
     assert!(!rig.stopped());
@@ -308,4 +308,46 @@ fn only_one_governor_runs() {
     let out = second.wait_with_output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("already running"));
+}
+
+#[test]
+fn a_changed_config_applies_without_a_restart_and_a_broken_one_is_ignored() {
+    let mut rig = Rig::new("reload", THROTTLE);
+    rig.start();
+    rig.wait_for(true, 6.0)
+        .expect("governor never paused the victim");
+    let cfg = rig.dir.join("config.toml");
+    let good = std::fs::read_to_string(&cfg).unwrap();
+    // A broken file is reported and the old settings stay: it keeps throttling.
+    std::fs::write(&cfg, "target_rmp = 1\n").unwrap();
+    let t = Instant::now();
+    while !rig.log().contains("config error") {
+        assert!(
+            t.elapsed().as_secs_f64() < 2.0 * PERIOD + 1.0,
+            "no config error logged\n{}",
+            rig.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    rig.wait_for(true, 2.0 * PERIOD + 1.0)
+        .expect("stopped throttling on a broken config");
+    // Full duty: from the next period on, nothing is paused.
+    std::fs::write(
+        &cfg,
+        good.replace("ceiling = 0.3", "floor = 1.0\nceiling = 1.0")
+            .replace("floor = 0.2\n", ""),
+    )
+    .unwrap();
+    let t = Instant::now();
+    while !rig.log().contains("config reloaded") {
+        assert!(
+            t.elapsed().as_secs_f64() < 2.0 * PERIOD + 1.0,
+            "no reload logged\n{}",
+            rig.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    rig.wait_for(false, PERIOD + 0.5)
+        .expect("victim still paused after reload");
+    rig.never_stopped(2.0 * PERIOD);
 }
