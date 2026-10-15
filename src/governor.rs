@@ -235,6 +235,9 @@ pub fn run(path: PathBuf) -> Result<(), String> {
 
     let mut next_outer = Instant::now();
     let mut hot_at_floor = 0u32;
+    // The duty averaged over the period, for the history: in temperature mode it moves every
+    // cycle, so one reading a period would be noise.
+    let (mut duty_sum, mut duty_secs) = (0.0f64, 0.0f64);
     while !STOP.load(Ordering::SeqCst) {
         if let Ok(Some(_)) = dog.try_wait() {
             log("watchdog exited; restarting it");
@@ -323,14 +326,23 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             out.history.push_back(Sample {
                 t: state::now(),
                 rpm: out.rpm,
-                duty: if paused { 1.0 } else { ctl.duty() },
+                duty: if paused {
+                    1.0
+                } else if duty_secs > 0.0 {
+                    duty_sum / duty_secs
+                } else {
+                    ctl.duty()
+                },
                 temp: out.temp,
                 setpoint: ctl.setpoint(),
             });
+            (duty_sum, duty_secs) = (0.0, 0.0);
         }
 
         let cycle = ctl.cycle(&config);
         let duty = ctl.duty();
+        duty_sum += duty * cycle;
+        duty_secs += cycle;
         // Paused, or at full duty, nothing is stopped: the fans are polled, and in temperature
         // mode the die is read once a cycle to know when to start.
         if paused || duty >= 1.0 - 1e-9 {

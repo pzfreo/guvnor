@@ -626,7 +626,10 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
             .style(Style::new().fg(DUTY))
             .data(&duty_pts),
     ])
-    .block(panel("Duty").title(key_line(&[("share of each period the work runs", DUTY)])))
+    .block(panel("Duty").title(key_line(&[(
+        "average share of each 10 s the work runs",
+        DUTY,
+    )])))
     .x_axis(x_axis)
     .y_axis(
         Axis::default()
