@@ -14,8 +14,9 @@ pub struct Config {
     /// "temperature": a fast loop holds a CPU die temperature that the fan rules move (default).
     /// "fans": the prototype, the fan rules setting the duty directly.
     pub control: Control,
-    /// Give each process its own place in the cycle, so only about duty × of them run at once
-    /// and the heat is steady, instead of pausing them all together.
+    /// Give each process its own place in the cycle, so only about duty × of them run at once,
+    /// instead of pausing them all together. Off by default: measured on a Mac17,7 under a heavy
+    /// build, pausing together got about 70% more work done for the same fan speed.
     pub stagger: bool,
     pub rules: Rules,
     pub temperature: Temperature,
@@ -130,7 +131,7 @@ impl Default for Config {
             target_rpm: 2500,
             period: 10.0,
             control: Control::Temperature,
-            stagger: true,
+            stagger: false,
             rules: Rules::default(),
             temperature: Temperature::default(),
             work: Work::default(),
@@ -290,8 +291,8 @@ pub const SAMPLE: &str = r#"# guvnor configuration. Every setting is optional; t
 target_rpm = 2500     # keep the fastest fan at or below this (base speed counts as within it)
 period = 10           # seconds per fan-rule step (and per duty cycle with control = "fans")
 control = "temperature"  # or "fans": the prototype, the fan rules setting the duty directly
-stagger = true        # each process pauses at its own time, so the heat is steady; false pauses
-                      # them all together
+stagger = false       # true: each process pauses at its own time, for level power. Measured,
+                      # pausing all together did more work for the same fan speed
 
 [rules]
 limit_above = 200     # fans above target + this: duty × limit_factor

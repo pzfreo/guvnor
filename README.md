@@ -144,12 +144,20 @@ before the cut, it cuts three or four times in a row and climbs again. That give
 
 ### Both
 
-**Staggered pauses** (`stagger = true`, the default). Each controlled process has its own place in
-the cycle, spread evenly (golden-ratio steps, so they stay spread as processes come and go). Each
-runs for its duty share of every cycle, but at any moment only about that share of them is running,
-so the power, and the die temperature, stay nearly level instead of jumping with every burst.
-`stagger = false` pauses them all together, as the prototype did. Either way a process's pause never
-exceeds `cycle × (1 − floor)`.
+**Pausing together or staggered.** By default all controlled processes run together at the start
+of each cycle and pause together, as in the prototype. With `stagger = true` each process gets its
+own place in the cycle instead (golden-ratio steps, so they stay spread as processes come and go),
+so only about the duty share of them runs at any moment and the power is nearly level. Either way
+a process's pause never exceeds `cycle × (1 − floor)`.
+
+Staggering looked better on paper, since these fans react to peak temperature. Measured live on
+the Mac17,7 under a heavy build, with the setpoint pinned at 85 °C and the two modes alternated
+every 3 minutes (twice each), it was worse: staggered averaged 14.8% duty at 3175 rpm, together
+25.4% at 3248 rpm, so pausing together got about 70% more work done for the same fan speed. A
+likely reason is that when everything pauses at once the whole chip can idle, which Apple silicon
+does efficiently; staggered, some cores are always busy. (One caveat: the SMC updates its sensors
+about twice a second, so readings in the synchronised mode may miss the peak. Fan speed, the
+quantity that matters, was nearly equal.)
 
 At duty 100% nothing is stopped and the governor does not look for work; it only reads the fans
 (and, in temperature mode, the die once a cycle). Work it finds is moved out of the background band

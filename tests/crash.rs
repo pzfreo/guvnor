@@ -422,7 +422,7 @@ fn staggered_processes_take_turns() {
     let pattern = format!("^/bin/sleep {}", rig.victim_secs().replace('.', "\\\\."));
     std::fs::write(
         rig.dir.join("config.toml"),
-        format!("period = 1.0\ncontrol = \"fans\"\n[rules]\nfloor = 0.3\nceiling = 0.3\n[work]\ncmdlines = [\"{pattern}\"]\n"),
+        format!("period = 1.0\ncontrol = \"fans\"\nstagger = true\n[rules]\nfloor = 0.3\nceiling = 0.3\n[work]\ncmdlines = [\"{pattern}\"]\n"),
     )
     .unwrap();
     rig.start();
