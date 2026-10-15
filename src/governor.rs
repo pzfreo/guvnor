@@ -316,7 +316,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             if hot_at_floor == 6 {
                 log(&format!(
                     "warning: die {:.0} °C with the work at the floor for a minute: the heat comes from \
-                     processes guvnor does not match (see top, and [work] in the config)",
+                     processes guvnor does not control (choose them in the dashboard, or [work] in the config)",
                     out.temp.unwrap_or_default()
                 ));
             }

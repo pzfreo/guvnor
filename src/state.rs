@@ -121,6 +121,32 @@ pub fn read_status() -> Option<Status> {
     serde_json::from_slice(&fs::read(dir().join("status.json")).ok()?).ok()
 }
 
+/// Per-process choices made in the dashboard: (pid, start time) of processes to control or to
+/// leave alone, whatever the config's rules say. They lapse when the process exits.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Pins {
+    pub on: Vec<(i32, u64)>,
+    pub off: Vec<(i32, u64)>,
+}
+
+pub fn read_pins() -> Pins {
+    fs::read(dir().join("pins.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Saves the choices, dropping those for processes that have exited.
+pub fn write_pins(pins: &Pins) -> std::io::Result<()> {
+    let live =
+        |&(pid, start): &(i32, u64)| crate::procs::info(pid).is_some_and(|p| p.start == start);
+    let pins = Pins {
+        on: pins.on.iter().copied().filter(live).collect(),
+        off: pins.off.iter().copied().filter(live).collect(),
+    };
+    write_atomic("pins.json", &serde_json::to_vec(&pins).unwrap())
+}
+
 /// Throttling is off while this file exists (`guvnor pause`); it survives restarts.
 pub fn paused() -> bool {
     dir().join("paused").exists()

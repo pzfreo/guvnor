@@ -12,7 +12,11 @@ pub struct Proc {
     pub name: String,
     pub stopped: bool,
     zombie: bool,
-    /// Why it counts as work: "name", "exe", "cmdline" or "tree".
+    /// Start time in microseconds: with the pid, it names one process even after the pid is reused.
+    pub start: u64,
+    /// Why it counts as work: "name", "exe", "cmdline", "tree" or "pid" (chosen in the
+    /// dashboard). Not work: "excluded" (exclude_names), "released" (chosen in the dashboard),
+    /// or "" (no rule matches).
     pub reason: &'static str,
 }
 
@@ -53,6 +57,7 @@ pub fn info(pid: i32) -> Option<Proc> {
         name,
         stopped: bi.pbi_status == libc::SSTOP,
         zombie: bi.pbi_status == 5, // SZOMB
+        start: bi.pbi_start_tvsec * 1_000_000 + bi.pbi_start_tvusec,
         reason: "",
     })
 }
@@ -127,6 +132,14 @@ pub struct Matcher {
     cmdlines: Option<Regex>,
     tree_names: Option<Regex>,
     tree_cmdlines: Option<Regex>,
+    exclude: Option<Regex>,
+}
+
+impl Proc {
+    /// Whether guvnor throttles it: matched by a rule and not excluded.
+    pub fn controlled(&self) -> bool {
+        !matches!(self.reason, "" | "excluded" | "released")
+    }
 }
 
 impl Matcher {
@@ -137,26 +150,54 @@ impl Matcher {
             cmdlines: any_of(&w.cmdlines, false),
             tree_names: any_of(&w.tree_names, true),
             tree_cmdlines: any_of(&w.tree_cmdlines, false),
+            exclude: any_of(&w.exclude_names, true),
         }
     }
 
     /// The current user's work processes. Never this process, its ancestors (the shell and
     /// terminal), its descendants (the watchdog), any other guvnor, or other users' processes.
     pub fn find(&self) -> Vec<Proc> {
-        self.find_in(
+        self.classify()
+            .into_iter()
+            .filter(Proc::controlled)
+            .collect()
+    }
+
+    /// Every process `find` could consider, with `reason` set to the rule that makes it work,
+    /// "excluded" when a rule matches but exclude_names wins, or "" when no rule matches.
+    pub fn classify(&self) -> Vec<Proc> {
+        let pins = crate::state::read_pins();
+        self.classify_in(
             all(),
             std::process::id() as i32,
             unsafe { libc::getuid() },
             args,
+            &pins,
         )
     }
 
+    #[cfg(test)]
     pub fn find_in(
         &self,
         procs: Vec<Proc>,
         me: i32,
         uid: u32,
         args: impl Fn(i32) -> Option<(String, String)>,
+    ) -> Vec<Proc> {
+        let pins = crate::state::Pins::default();
+        self.classify_in(procs, me, uid, args, &pins)
+            .into_iter()
+            .filter(Proc::controlled)
+            .collect()
+    }
+
+    pub fn classify_in(
+        &self,
+        procs: Vec<Proc>,
+        me: i32,
+        uid: u32,
+        args: impl Fn(i32) -> Option<(String, String)>,
+        pins: &crate::state::Pins,
     ) -> Vec<Proc> {
         let by_pid: HashMap<i32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
         let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -229,13 +270,22 @@ impl Matcher {
         for pid in descendants(&mut roots) {
             work.entry(pid).or_insert("tree");
         }
+        let excluded = |p: &Proc| self.exclude.as_ref().is_some_and(|r| r.is_match(&p.name));
         let mut out: Vec<Proc> = candidates
             .into_iter()
-            .filter_map(|p| {
-                work.get(&p.pid).map(|&reason| Proc {
+            .map(|p| {
+                // Choices for one process win over the config's rules.
+                let reason = match work.get(&p.pid) {
+                    _ if pins.off.contains(&(p.pid, p.start)) => "released",
+                    _ if pins.on.contains(&(p.pid, p.start)) => "pid",
+                    Some(_) if excluded(p) => "excluded",
+                    Some(&r) => r,
+                    None => "",
+                };
+                Proc {
                     reason,
                     ..p.clone()
-                })
+                }
             })
             .collect();
         out.sort_by_key(|p| p.pid);
@@ -301,6 +351,7 @@ mod tests {
             name: name.into(),
             stopped: false,
             zombie: false,
+            start: pid as u64 * 7,
             reason: "",
         }
     }
@@ -325,6 +376,18 @@ mod tests {
             p(40, 11, 501, "ldx"), // names are whole-name matches
         ];
         let w = Work {
+            names: [
+                "rustc",
+                "cargo",
+                "ld",
+                "clang",
+                "cc",
+                "cargo-clippy",
+                "clippy-driver",
+            ]
+            .map(String::from)
+            .to_vec(),
+            exes: vec!["/(release|debug)/".into()],
             tree_names: vec!["make".into()],
             ..Work::default()
         };
@@ -357,6 +420,49 @@ mod tests {
     }
 
     #[test]
+    fn exclude_names_wins_over_every_rule() {
+        let procs = vec![
+            p(11, 1, 501, "zsh"),
+            p(20, 11, 501, "cargo"),
+            p(21, 20, 501, "rustc"),
+        ];
+        let w = Work {
+            names: vec!["cargo".into(), "rustc".into()],
+            exclude_names: vec!["rustc".into()],
+            ..Work::default()
+        };
+        let all: Vec<(i32, &str)> = Matcher::new(&w)
+            .classify_in(procs, 999, 501, |_| None, &crate::state::Pins::default())
+            .iter()
+            .map(|p| (p.pid, p.reason))
+            .collect();
+        assert_eq!(all, vec![(11, ""), (20, "name"), (21, "excluded")]);
+    }
+
+    #[test]
+    fn choices_for_one_process_win_and_follow_the_start_time() {
+        let procs = vec![
+            p(11, 1, 501, "zsh"),
+            p(20, 11, 501, "python3.14"),
+            p(21, 11, 501, "rustc"),
+        ];
+        let pins = crate::state::Pins {
+            on: vec![(20, 140), (11, 1)], // zsh's entry has the wrong start time: a reused pid
+            off: vec![(21, 147)],
+        };
+        let w = Work {
+            names: vec!["rustc".into()],
+            ..Work::default()
+        };
+        let all: Vec<(i32, &str)> = Matcher::new(&w)
+            .classify_in(procs, 999, 501, |_| None, &pins)
+            .iter()
+            .map(|p| (p.pid, p.reason))
+            .collect();
+        assert_eq!(all, vec![(11, ""), (20, "pid"), (21, "released")]);
+    }
+
+    #[test]
     fn a_cargo_process_launching_the_governor_is_protected() {
         // `cargo run -- run` makes cargo an ancestor of the governor.
         let procs = vec![
@@ -364,7 +470,11 @@ mod tests {
             p(20, 11, 501, "cargo"),
             p(21, 20, 501, "guvnor"),
         ];
-        let found = Matcher::new(&Work::default()).find_in(procs, 21, 501, |_| None);
+        let w = Work {
+            names: vec!["cargo".into()],
+            ..Work::default()
+        };
+        let found = Matcher::new(&w).find_in(procs, 21, 501, |_| None);
         assert!(found.is_empty());
     }
 

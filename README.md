@@ -39,12 +39,24 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
   paused, with a countdown;
 - the fan speed and the duty over the last hour (starting at 5 minutes and widening as history
   builds), with the target, HIGH and LIMIT lines;
-- the work processes, each running or paused, with its CPU use and why it matched;
+- your processes: those guvnor controls (running or paused, and what controls them), then any
+  others using 5% CPU or more (`○ free`), then any you excluded;
 - the governor's recent events, coloured.
 
-Keys: `p` pauses or resumes throttling, `+` / `-` move the target by 100 rpm (saved to the config,
-keeping its comments; the governor applies it within a period), `q` quits. With no governor
-running it still shows the fans and the matched processes.
+Keys:
+
+- `↑` / `↓` (or `j` / `k`) select a process, and `Enter` cycles it through **off → this → all**:
+  - **this**: control just this process, until it exits. Remembered by pid and start time in the
+    state directory, so a reused pid is not mistaken for it; the config is not touched.
+  - **all**: control every process like it, through a rule in `[work] names`. Versions and cargo's
+    hash suffixes count as alike: `python3.14` adds `python[0-9.]*`, `sheets-c15f…` adds
+    `sheets-[0-9a-f]{16}`.
+  - **off**: removes that rule, or, if another rule still catches the process, adds it to
+    `exclude_names`.
+- `p` pauses or resumes throttling; `+` / `-` move the target by 100 rpm; `q` quits.
+
+Config changes keep the file's comments, and the governor applies them within a period. With no
+governor running the dashboard still shows the fans and your processes.
 
 ## Commands
 
@@ -72,10 +84,12 @@ an error. `guvnor config` prints them all with comments. In short:
 - `[rules]`: above `target + limit_above` (2700) duty × 0.7; above `target + high_above` (2600)
   duty × 0.9; fans off (below 2000) +10 points every 3 periods; at base speed +5 points every 6;
   `floor` 0.2, `ceiling` 1.0; `cut_hold` and `relearn_every` (below).
-- `[work]`: `names` (whole process name, like `pgrep -x`; default the Rust/C toolchain), `exes`
-  (search in the executable's path; default `/(release|debug)/`, i.e. built programs and test
-  binaries in `target/` or any other cargo `--target-dir`), `cmdlines` (search in the whole command line, like `pgrep -f`; empty by default), and
-  `tree_names` / `tree_cmdlines` (that process and all its descendants).
+- `[work]`: which processes are throttled. **Empty by default: nothing is controlled until you
+  choose**, in the dashboard or here. `names` (whole process name, like `pgrep -x`), `exes` (search
+  in the executable's path, e.g. `/(release|debug)/` for anything cargo builds), `cmdlines`
+  (search in the whole command line, like `pgrep -f`), `tree_names` / `tree_cmdlines` (that process
+  and all its descendants), and `exclude_names` (never, whatever else matches). `guvnor config`
+  shows examples for Rust, C/C++, Python and media tools.
 - `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
 
 The governor notices a changed config at the next period and applies it, logging `config
@@ -159,11 +173,10 @@ another user's process, or a process already stopped by someone else (Ctrl-Z).
 - **Throttled work takes longer in wall-clock time.** Tests with wall-time timeouts can fail, and
   timing benchmarks are meaningless while throttled. Measure work in instructions retired
   (`/usr/bin/time -l`), not wall time, or `guvnor pause` first.
-- **Matching is by name and path.** Every build and test binary of yours is throttled, including
-  ones another session or tool started. The dashboard and `guvnor status` list what matches and
-  why. The prototype's `pgrep -f` matching (still available as `cmdlines`) also caught shells and
-  scripts that merely mention a `target/` path; the default now matches the executable's path
-  only.
+- **Rules match broadly.** A rule like `exes = ["/(release|debug)/"]` throttles every build and
+  test binary of yours, including ones another session or tool started. The dashboard and
+  `guvnor status` list what is controlled and why. `cmdlines` (the prototype's `pgrep -f`) also
+  catches shells and scripts that merely mention the text, so prefer `names` or `exes`.
 - **A process paused mid-network-exchange** can time out at the other end, as with any SIGSTOP.
 - If both the governor and its watchdog are killed while no LaunchAgent is installed (a
   foreground `guvnor run`), work stays paused until you run `guvnor status`, `guvnor pause` or

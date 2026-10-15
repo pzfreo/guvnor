@@ -106,6 +106,8 @@ pub struct Work {
     pub tree_names: Vec<String>,
     /// A process whose command line matches is work, and so are all its descendants.
     pub tree_cmdlines: Vec<String>,
+    /// Regexes on the whole process name: never work, whatever else matches.
+    pub exclude_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -153,23 +155,17 @@ impl Default for Rules {
     }
 }
 
+/// Nothing is work until you say so: in the dashboard (select a busy process, press Enter) or
+/// with rules in [work]. What counts as heavy background work differs from person to person.
 impl Default for Work {
     fn default() -> Self {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
         Work {
-            names: s(&[
-                "rustc",
-                "cargo",
-                "ld",
-                "clang",
-                "cc",
-                "cargo-clippy",
-                "clippy-driver",
-            ]),
-            exes: s(&["/(release|debug)/"]),
+            names: vec![],
+            exes: vec![],
             cmdlines: vec![],
             tree_names: vec![],
             tree_cmdlines: vec![],
+            exclude_names: vec![],
         }
     }
 }
@@ -259,9 +255,11 @@ impl Config {
         for p in w
             .names
             .iter()
+            .chain(&w.exes)
             .chain(&w.cmdlines)
             .chain(&w.tree_names)
             .chain(&w.tree_cmdlines)
+            .chain(&w.exclude_names)
         {
             regex::Regex::new(p).map_err(|e| format!("bad regex {p:?}: {e}"))?;
         }
@@ -306,17 +304,25 @@ relearn_every = 30    # rises stop just below the duty that last overshot; after
                       # with cut_hold = 0 that is exactly the prototype's behaviour)
 
 [work]
-# Regexes on the whole process name (like pgrep -x).
-names = ["rustc", "cargo", "ld", "clang", "cc", "cargo-clippy", "clippy-driver"]
-# Regexes searched for in the executable's path: built programs and test binaries, in target/
-# or any other cargo --target-dir.
-exes = ["/(release|debug)/"]
-# Regexes searched for in the full command line (like pgrep -f). This also catches shells and
-# scripts that merely mention a path, so prefer exes.
+# Which processes guvnor throttles. Nothing until you choose: in the dashboard (`guvnor`),
+# select a busy process and press Enter to cycle it through off -> just this process -> all
+# like it, which edits names and exclude_names here. Or write rules; each is a regex.
+#
+# The whole process name (like pgrep -x). For example:
+#   Rust:   ["rustc", "cargo", "ld", "cc"]      C/C++:  ["clang", "cc1plus", "ld", "make"]
+#   Python: ["python[0-9.]*"]                   Media:  ["ffmpeg", "HandBrakeCLI", "blender"]
+names = []
+# Searched for in the executable's path, e.g. ["/(release|debug)/"] for programs and tests
+# built by cargo, or ["^/Users/me/project/"].
+exes = []
+# Searched for in the full command line (like pgrep -f). This also catches shells and scripts
+# that merely mention the text, so prefer names or exes.
 cmdlines = []
-# A process matching these, and all its descendants, is work.
+# A process matching these, and all its descendants, is work, e.g. ["make", "xcodebuild"].
 tree_names = []
 tree_cmdlines = []
+# Never work, whatever else matches (whole process name).
+exclude_names = []
 
 # On battery: cap the duty, lower the target, or both. Uncomment to enable.
 # [battery]
@@ -340,6 +346,8 @@ mod tests {
         assert!(Config::parse("target_rmp = 2400").is_err());
         assert!(Config::parse("[rules]\nfloor = 0").is_err());
         assert!(Config::parse("[work]\nnames = [\"(\"]").is_err());
+        assert!(Config::parse("[work]\nexes = [\"(\"]").is_err());
+        assert!(Config::parse("[work]\nexclude_names = [\"(\"]").is_err());
     }
 
     #[test]
