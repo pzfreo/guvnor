@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long the heartbeat may stop before the watchdog continues the work itself.
-pub const GRACE: f64 = 0.5;
+pub const GRACE: f64 = 1.0;
 
 /// The governor's end: the watchdog process and the heartbeat pipe to it.
 pub struct Dog {

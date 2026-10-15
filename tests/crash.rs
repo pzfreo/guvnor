@@ -205,7 +205,7 @@ fn a_hung_governor_cannot_hold_a_pause_past_its_bound() {
     rig.wait_for(false, 4.0)
         .expect("victim left stopped while the governor hung");
     let held = began.elapsed().as_secs_f64();
-    let bound = PERIOD * (1.0 - FLOOR) + 0.5 + 0.25 + 0.1; // + watchdog grace, poll, slack
+    let bound = PERIOD * (1.0 - FLOOR) + 1.0 + 0.1 + 0.1; // + watchdog grace, poll, slack
     assert!(held <= bound, "paused {held:.2} s, bound {bound:.2} s");
     unsafe { libc::kill(gov as i32, libc::SIGCONT) };
 }

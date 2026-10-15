@@ -193,12 +193,13 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     }
     // Anything left paused by an earlier governor that died runs again first.
     let n = continue_all(&matcher);
-    let mut dog = Dog::spawn().map_err(|e| format!("cannot start the watchdog: {e}"))?;
-
     let mut power = Power::current();
     let (target, ceiling) = config.effective(power);
     let rpm = smc.rpm();
+    // Finding the sensors lists every SMC key, which takes a second or two: do it before the
+    // watchdog starts expecting heartbeats.
     let mut ctl = Ctl::new(&config, &smc, rpm, ceiling);
+    let mut dog = Dog::spawn().map_err(|e| format!("cannot start the watchdog: {e}"))?;
     let mut was_paused = state::paused();
     let mut seen: HashSet<i32> = HashSet::new();
     let mut mtime = modified(&path);

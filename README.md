@@ -170,10 +170,10 @@ this:
    before sending SIGSTOP. A separate watchdog process (in its own session, so Ctrl-C and terminal
    signals don't reach it) gets a heartbeat over a pipe at least every 100 ms. If the pipe closes
    (the governor exited or was killed) it continues them all at once; if the heartbeat stops for
-   half a second (the governor hung) it continues them and keeps watching. If both are killed, the
+   a second (the governor hung) it continues them and keeps watching. If both are killed, the
    LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor pause`.
 3. **Every pause is bounded**: no longer than `cycle × (1 − floor)`: 0.95 s in temperature mode,
-   8 s with the fan rules. If the governor hangs, the watchdog continues the work within half a
+   8 s with the fan rules. If the governor hangs, the watchdog continues the work within a
    second of the last heartbeat.
 
 It never pauses itself, its watchdog, its ancestors (your shell and terminal), any `guvnor`,
