@@ -37,8 +37,8 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
   zone: off, base, high, LIMIT;
 - the duty, the learned cap and the ceiling, and where the current period is: work running or
   paused, with a countdown;
-- the fan speed and the duty over the last hour (starting at 5 minutes and widening as history
-  builds), with the target, HIGH and LIMIT lines;
+- the fan speed, the duty and the die temperature (hottest reading each period, with the
+  setpoint) over the last hour, starting at 5 minutes and widening as history builds;
 - your processes: those guvnor controls (running or paused, and what controls them), then any
   others using 5% CPU or more (`○ free`), then any you excluded;
 - the governor's recent events, coloured.
@@ -115,8 +115,10 @@ So there are two loops:
   the bursts too brief to heat the die, and the die answers within about a second.
 - **A slow loop** (every 10 s period) applies the prototype's fan rules to the *setpoint* instead
   of the duty: above LIMIT 4 °C down (and the duty cut by 30% at once), above HIGH 2 °C down, fans
-  off 1 °C up every 3 periods, base speed 1 °C up every 6. It finds the die temperature at which the
-  fans stay at base speed, and follows changes in load and room temperature.
+  off or more than 100 rpm below the target 1 °C up every 3 periods, at the target 1 °C up every 6.
+  It finds the die temperature at which the fans sit at the target, and follows changes in load
+  and room temperature. (At a 2500 target, base speed counts as at the target. At a higher target
+  the fans well below it get the fast rise; the slow one is only for probing near it.)
 
 Two details came from live runs. While the fans are falling the slow loop never cuts, even above
 LIMIT: the fast loop already has the die under control, and the fans are only shedding old heat.
@@ -142,6 +144,13 @@ before the cut, it cuts three or four times in a row and climbs again. That give
 
 ### Both
 
+**Staggered pauses** (`stagger = true`, the default). Each controlled process has its own place in
+the cycle, spread evenly (golden-ratio steps, so they stay spread as processes come and go). Each
+runs for its duty share of every cycle, but at any moment only about that share of them is running,
+so the power, and the die temperature, stay nearly level instead of jumping with every burst.
+`stagger = false` pauses them all together, as the prototype did. Either way a process's pause never
+exceeds `cycle × (1 − floor)`.
+
 At duty 100% nothing is stopped and the governor does not look for work; it only reads the fans
 (and, in temperature mode, the die once a cycle). Work it finds is moved out of the background band
 (`taskpolicy -B`), so nothing is left on the efficiency cores only.
@@ -157,13 +166,15 @@ If the governor died during a pause, the work would stay stopped for good. Three
 this:
 
 1. **On start** it continues every matching process, and everything the last governor recorded.
-2. **It records every pause** in `~/.local/state/guvnor/stopped.json` before sending SIGSTOP. A
-   separate watchdog process (in its own session, so Ctrl-C and terminal signals don't reach it)
-   continues them within a quarter second if the governor exits or is killed. If both are killed,
-   the LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor pause`.
+2. **It records every process it may pause** in `~/.local/state/guvnor/stopped.json`, each cycle,
+   before sending SIGSTOP. A separate watchdog process (in its own session, so Ctrl-C and terminal
+   signals don't reach it) gets a heartbeat over a pipe at least every 100 ms. If the pipe closes
+   (the governor exited or was killed) it continues them all at once; if the heartbeat stops for
+   half a second (the governor hung) it continues them and keeps watching. If both are killed, the
+   LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor pause`.
 3. **Every pause is bounded**: no longer than `cycle × (1 − floor)`: 0.95 s in temperature mode,
-   8 s with the fan rules. If the governor hangs, the watchdog continues the work at that
-   deadline (plus half a second).
+   8 s with the fan rules. If the governor hangs, the watchdog continues the work within half a
+   second of the last heartbeat.
 
 It never pauses itself, its watchdog, its ancestors (your shell and terminal), any `guvnor`,
 another user's process, or a process already stopped by someone else (Ctrl-Z).

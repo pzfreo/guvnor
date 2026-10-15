@@ -14,6 +14,7 @@ pub enum Reason {
     Limit,
     High,
     Off,
+    Below,
     Base,
 }
 
@@ -86,8 +87,8 @@ impl Thermal {
 
     /// The slow loop: once a period, with the fan speed. The prototype's rules, moving the
     /// setpoint by `step` °C where they moved the duty by points: above LIMIT 4 steps down (and the
-    /// duty cut at once), above HIGH 2 down, fans off 1 up every off_every periods, base speed
-    /// 1 up every base_every. After a cut, wait cut_hold periods (the fans lag the heat) and,
+    /// duty cut at once), above HIGH 2 down, fans off or well below the target 1 up every
+    /// off_every periods, at the target (base speed for a 2500 target) 1 up every base_every. After a cut, wait cut_hold periods (the fans lag the heat) and,
     /// never cut while the fans are falling. The first cut of an overshoot also slows the
     /// base-speed rises, so the probing for a higher setpoint gets rarer once one has failed.
     pub fn outer(&mut self, rpm: u32, target: u32) -> Option<Change> {
@@ -123,14 +124,22 @@ impl Thermal {
             self.since_cut = 0;
             self.recovering = true;
         } else {
+            // Fans off, or well below the target: plenty of room, so rise at the fast rate.
             let off = rpm < r.off_below;
-            reason = if off { Reason::Off } else { Reason::Base };
-            if off {
+            let below = !off && rpm + r.high_above < target;
+            reason = if off {
+                Reason::Off
+            } else if below {
+                Reason::Below
+            } else {
+                Reason::Base
+            };
+            if off || below {
                 self.slow = 1;
             }
             self.ticks += 1;
             if self.ticks
-                < if off {
+                < if off || below {
                     r.off_every
                 } else {
                     r.base_every * self.slow
@@ -320,6 +329,23 @@ mod tests {
             "setpoint fell to {}",
             c.setpoint()
         );
+    }
+
+    #[test]
+    fn fans_well_below_a_high_target_raise_the_setpoint_quickly() {
+        // Target 5000 with the fans at 2900: one step per off_every periods, not per base_every.
+        let mut c = Thermal::new(Rules::default(), Temperature::default(), 1.0);
+        let start = c.setpoint();
+        for _ in 0..30 {
+            c.outer(2900, 5000);
+        }
+        assert_eq!(c.setpoint(), start + 10.0);
+        // At a 2500 target, base speed is at the target: the slow rate.
+        let mut c = Thermal::new(Rules::default(), Temperature::default(), 1.0);
+        for _ in 0..30 {
+            c.outer(2550, 2500);
+        }
+        assert_eq!(c.setpoint(), start + 5.0);
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub struct Config {
     /// "temperature": a fast loop holds a CPU die temperature that the fan rules move (default).
     /// "fans": the prototype, the fan rules setting the duty directly.
     pub control: Control,
+    /// Give each process its own place in the cycle, so only about duty × of them run at once
+    /// and the heat is steady, instead of pausing them all together.
+    pub stagger: bool,
     pub rules: Rules,
     pub temperature: Temperature,
     pub work: Work,
@@ -127,6 +130,7 @@ impl Default for Config {
             target_rpm: 2500,
             period: 10.0,
             control: Control::Temperature,
+            stagger: true,
             rules: Rules::default(),
             temperature: Temperature::default(),
             work: Work::default(),
@@ -284,7 +288,10 @@ impl Config {
 pub const SAMPLE: &str = r#"# guvnor configuration. Every setting is optional; these are the defaults.
 
 target_rpm = 2500     # keep the fastest fan at or below this (base speed counts as within it)
-period = 10           # seconds per duty cycle: work runs duty × period, then is paused
+period = 10           # seconds per fan-rule step (and per duty cycle with control = "fans")
+control = "temperature"  # or "fans": the prototype, the fan rules setting the duty directly
+stagger = true        # each process pauses at its own time, so the heat is steady; false pauses
+                      # them all together
 
 [rules]
 limit_above = 200     # fans above target + this: duty × limit_factor

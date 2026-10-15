@@ -31,13 +31,12 @@ fn write_atomic(name: &str, data: &[u8]) -> std::io::Result<()> {
     fs::rename(tmp, path)
 }
 
-/// The processes the governor has paused, written before it pauses them. If the governor dies,
-/// its watchdog, a restarted governor or `guvnor status`/`pause` resume them from this file.
+/// The processes the governor may have paused this cycle, written before it pauses any. If the
+/// governor dies or stalls, its watchdog, a restarted governor or `guvnor status`/`pause`
+/// continue them from this file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stopped {
     pub governor: i32,
-    /// No process may stay paused past this time; the watchdog resumes them shortly after.
-    pub deadline: f64,
     pub pids: Vec<i32>,
 }
 
@@ -81,7 +80,8 @@ pub struct Status {
     pub ceiling: f64,
     pub period: f64,
     pub paused: bool,
-    /// "run" or "pause" within a throttled period; "full" at 100 % duty; "off" when paused.
+    /// "run" or "pause" within a synchronised cycle, "stagger" with staggered pauses, "full" at
+    /// 100 % duty, "off" when paused.
     pub phase: String,
     /// When the current phase ends.
     pub phase_end: f64,

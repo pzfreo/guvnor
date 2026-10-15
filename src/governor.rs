@@ -2,13 +2,14 @@
 
 use crate::config::{Config, Control};
 use crate::controller::Controller;
+use crate::log;
 use crate::power::Power;
 use crate::procs::{self, Matcher};
 use crate::smc::Smc;
 use crate::state::{self, Sample};
 use crate::thermal::Thermal;
-use crate::{log, watchdog};
-use std::collections::{HashSet, VecDeque};
+use crate::watchdog::Dog;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -22,21 +23,6 @@ extern "C" fn on_signal(_: i32) {
 /// Samples kept for the dashboard: an hour at the default period.
 const HISTORY: usize = 360;
 
-/// Sleeps in short slices; returns false early when asked to exit or when paused.
-fn nap(secs: f64) -> bool {
-    let end = Instant::now() + Duration::from_secs_f64(secs.max(0.0));
-    loop {
-        if STOP.load(Ordering::SeqCst) || state::paused() {
-            return false;
-        }
-        let left = end.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return true;
-        }
-        std::thread::sleep(left.min(Duration::from_millis(50)));
-    }
-}
-
 fn pct(d: f64) -> String {
     format!("{:.0}%", d * 100.0)
 }
@@ -48,6 +34,21 @@ fn continue_all(matcher: &Matcher) -> usize {
         procs::signal(p.pid, libc::SIGCONT);
     }
     n.max(work.len())
+}
+
+/// Continues every process guvnor is holding stopped.
+fn continue_held(held: &mut HashSet<i32>) {
+    for pid in held.drain() {
+        procs::signal(pid, libc::SIGCONT);
+    }
+}
+
+fn sleep_beating(dog: &mut Dog, secs: f64) {
+    let end = Instant::now() + Duration::from_secs_f64(secs);
+    while Instant::now() < end && !STOP.load(Ordering::SeqCst) {
+        dog.beat();
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -91,13 +92,6 @@ impl Ctl {
         match self {
             Ctl::Fans(_) => config.period,
             Ctl::Temp(..) => config.temperature.period,
-        }
-    }
-
-    fn floor(&self, config: &Config) -> f64 {
-        match self {
-            Ctl::Fans(_) => config.rules.floor,
-            Ctl::Temp(..) => config.temperature.floor,
         }
     }
 
@@ -199,7 +193,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     }
     // Anything left paused by an earlier governor that died runs again first.
     let n = continue_all(&matcher);
-    let mut dog = watchdog::spawn().map_err(|e| format!("cannot start the watchdog: {e}"))?;
+    let mut dog = Dog::spawn().map_err(|e| format!("cannot start the watchdog: {e}"))?;
 
     let mut power = Power::current();
     let (target, ceiling) = config.effective(power);
@@ -238,11 +232,19 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     // The duty averaged over the period, for the history: in temperature mode it moves every
     // cycle, so one reading a period would be noise.
     let (mut duty_sum, mut duty_secs) = (0.0f64, 0.0f64);
+    // The hottest die reading in the period, for the history.
+    let mut temp_max: Option<f64> = None;
+    // Each process's place in the cycle (0..1), kept for as long as it is work, so its pauses
+    // stay bounded; and the processes guvnor holds stopped right now.
+    let mut offsets: HashMap<i32, f64> = HashMap::new();
+    let mut next_offset = 0.0f64;
+    let mut held: HashSet<i32> = HashSet::new();
     while !STOP.load(Ordering::SeqCst) {
-        if let Ok(Some(_)) = dog.try_wait() {
+        if dog.exited() {
             log("watchdog exited; restarting it");
-            dog = watchdog::spawn().map_err(|e| format!("cannot restart the watchdog: {e}"))?;
+            dog = Dog::spawn().map_err(|e| format!("cannot restart the watchdog: {e}"))?;
         }
+        dog.beat();
         let paused = state::paused();
         if paused != was_paused {
             log(if paused {
@@ -333,10 +335,11 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 } else {
                     ctl.duty()
                 },
-                temp: out.temp,
+                temp: temp_max.or(out.temp),
                 setpoint: ctl.setpoint(),
             });
             (duty_sum, duty_secs) = (0.0, 0.0);
+            temp_max = None;
         }
 
         let cycle = ctl.cycle(&config);
@@ -346,31 +349,24 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         // Paused, or at full duty, nothing is stopped: the fans are polled, and in temperature
         // mode the die is read once a cycle to know when to start.
         if paused || duty >= 1.0 - 1e-9 {
+            continue_held(&mut held);
             out.write(&ctl, &config, if paused { "off" } else { "full" }, cycle);
             let end = Instant::now() + Duration::from_secs_f64(cycle);
             while Instant::now() < end && !STOP.load(Ordering::SeqCst) && state::paused() == paused
             {
+                dog.beat();
                 std::thread::sleep(Duration::from_millis(50));
             }
             if !paused && let Some(t) = ctl.inner(&smc, cycle, out.ceiling) {
                 out.temp = Some(t);
+                temp_max = Some(temp_max.map_or(t, |m: f64| m.max(t)));
             }
             continue;
         }
 
-        // Run for duty × cycle, then read the die at its hottest.
-        out.write(&ctl, &config, "run", duty * cycle);
-        if !nap(duty * cycle) {
-            continue;
-        }
-        if let Some(t) = ctl.inner(&smc, cycle, out.ceiling) {
-            out.temp = Some(t);
-        }
-
-        // Pause for the rest. Builds spawn short-lived processes, so look for work now. Work
-        // found is moved out of the background band once. A process already stopped by someone
-        // else (Ctrl-Z) is left alone, so it is not resumed later.
-        let pause = cycle * (1.0 - duty);
+        // This cycle's work. Builds spawn short-lived processes, so look every cycle. Work found
+        // is moved out of the background band once. A process stopped by someone else (Ctrl-Z),
+        // not by guvnor, is left alone, so it is not resumed later.
         let work = matcher.find();
         seen.retain(|pid| work.iter().any(|p| p.pid == *pid));
         for p in &work {
@@ -382,40 +378,97 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             }
         }
         let pids: Vec<i32> = work
-            .into_iter()
-            .filter(|p| !p.stopped)
+            .iter()
+            .filter(|p| !p.stopped || held.contains(&p.pid))
             .map(|p| p.pid)
             .collect();
-        out.write(&ctl, &config, "pause", pause);
-        if pids.is_empty() {
-            nap(pause);
-            continue;
+        // Anything that is no longer work (exited, or no longer matched) runs again.
+        for pid in held.clone() {
+            if !pids.contains(&pid) {
+                procs::signal(pid, libc::SIGCONT);
+                held.remove(&pid);
+            }
         }
-        let stopped = state::Stopped {
+        offsets.retain(|pid, _| pids.contains(pid));
+        for &pid in &pids {
+            // Staggered: golden-ratio steps spread the places evenly however many come and go.
+            offsets.entry(pid).or_insert_with(|| {
+                if config.stagger {
+                    next_offset = (next_offset + 0.618_033_988_75).fract();
+                    next_offset
+                } else {
+                    0.0
+                }
+            });
+        }
+        let record = state::Stopped {
             governor: std::process::id() as i32,
-            deadline: state::now() + pause.min(cycle * (1.0 - ctl.floor(&config))),
             pids: pids.clone(),
         };
-        if let Err(e) = state::write_stopped(&stopped) {
+        if pids.is_empty() {
+            state::clear_stopped();
+        } else if let Err(e) = state::write_stopped(&record) {
             log(&format!(
                 "error: cannot record the paused processes, not pausing: {e}"
             ));
-            nap(pause);
+            continue_held(&mut held);
+            sleep_beating(&mut dog, cycle);
             continue;
         }
-        for &pid in &pids {
-            procs::signal(pid, libc::SIGSTOP);
+
+        // Step through the cycle: each process runs while its place is within the duty, so with
+        // staggering about duty × of them run at any moment; without it, all run together first.
+        let stagger_phase = config.stagger && pids.len() > 1;
+        out.write(
+            &ctl,
+            &config,
+            if stagger_phase { "stagger" } else { "run" },
+            if stagger_phase { cycle } else { duty * cycle },
+        );
+        let tick = Duration::from_secs_f64((cycle / 50.0).clamp(0.02, 0.1));
+        let start = Instant::now();
+        let (mut read, mut wrote_pause) = (false, false);
+        let mut interrupted = false;
+        loop {
+            if STOP.load(Ordering::SeqCst) || state::paused() {
+                interrupted = true;
+                break;
+            }
+            let phase = start.elapsed().as_secs_f64() / cycle;
+            if phase >= 1.0 {
+                break;
+            }
+            for &pid in &pids {
+                let run = (phase - offsets[&pid]).rem_euclid(1.0) < duty;
+                if run && held.remove(&pid) {
+                    procs::signal(pid, libc::SIGCONT);
+                } else if !run && held.insert(pid) {
+                    procs::signal(pid, libc::SIGSTOP);
+                }
+            }
+            // Read the die once a cycle; without staggering, at the end of the run, its hottest.
+            if !read && phase >= duty {
+                read = true;
+                if let Some(t) = ctl.inner(&smc, cycle, out.ceiling) {
+                    out.temp = Some(t);
+                    temp_max = Some(temp_max.map_or(t, |m: f64| m.max(t)));
+                }
+            }
+            if !stagger_phase && !wrote_pause && phase >= duty {
+                wrote_pause = true;
+                out.write(&ctl, &config, "pause", cycle * (1.0 - phase));
+            }
+            dog.beat();
+            std::thread::sleep(tick);
         }
-        nap(pause);
-        for &pid in &pids {
-            procs::signal(pid, libc::SIGCONT);
+        if interrupted {
+            continue_held(&mut held);
+            state::clear_stopped();
         }
-        state::clear_stopped();
     }
 
     let n = continue_all(&matcher);
     log(&format!("exit: continued {n} work processes"));
-    let _ = dog.kill();
-    let _ = dog.wait();
+    dog.stop();
     Ok(())
 }

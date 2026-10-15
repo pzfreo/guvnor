@@ -90,7 +90,8 @@ impl Controller {
     pub fn update(&mut self, rpm: u32, target: u32, ceiling: f64) -> Option<Change> {
         let r = self.rules.clone();
         let old = self.duty;
-        let off = rpm < r.off_below;
+        // Fans off, or well below the target, both mean plenty of room: the fast rise.
+        let off = rpm < r.off_below || rpm + r.high_above < target;
         self.since_cut = self.since_cut.saturating_add(1);
         // Until the fans come back below HIGH after a cut, they are still catching up with the
         // duty before it: cut again only after the hold, and below LIMIT only if they are not

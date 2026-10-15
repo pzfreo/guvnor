@@ -13,6 +13,7 @@ const FLOOR: f64 = 0.2;
 struct Rig {
     dir: PathBuf,
     victim: Child,
+    secs: String,
     governors: Vec<Child>,
 }
 
@@ -41,8 +42,13 @@ impl Rig {
         Rig {
             dir,
             victim,
+            secs,
             governors: vec![],
         }
+    }
+
+    fn victim_secs(&self) -> String {
+        self.secs.clone()
     }
 
     fn cmd(&self, arg: &str) -> Command {
@@ -383,4 +389,68 @@ fn temperature_mode_pauses_briefly_and_a_crash_leaves_nothing_stopped() {
     rig.wait_for(false, 1.0)
         .expect("victim left stopped after the governor was killed");
     rig.never_stopped(2.0);
+}
+
+/// Kills the children it holds when dropped, so a failed test leaves nothing behind.
+struct Kids(Vec<Child>);
+
+impl Drop for Kids {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            unsafe { libc::kill(c.id() as i32, libc::SIGCONT) };
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+#[test]
+fn staggered_processes_take_turns() {
+    // Three processes at a fixed duty of 0.3 on a 1 s cycle: each runs about 30% of the time,
+    // and they rarely run together (synchronised, all three would run at once).
+    let mut rig = Rig::new("stagger", "");
+    let others = Kids(
+        (1..3)
+            .map(|i| {
+                Command::new("/bin/sleep")
+                    .arg(format!("{}{i}", rig.victim_secs()))
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let pattern = format!("^/bin/sleep {}", rig.victim_secs().replace('.', "\\\\."));
+    std::fs::write(
+        rig.dir.join("config.toml"),
+        format!("period = 1.0\ncontrol = \"fans\"\n[rules]\nfloor = 0.3\nceiling = 0.3\n[work]\ncmdlines = [\"{pattern}\"]\n"),
+    )
+    .unwrap();
+    rig.start();
+    rig.wait_for(true, 6.0)
+        .expect("governor never paused the victim");
+    std::thread::sleep(Duration::from_millis(1500));
+    let pids: Vec<u32> = std::iter::once(rig.victim.id())
+        .chain(others.0.iter().map(|c| c.id()))
+        .collect();
+    let (mut samples, mut together, mut running) = (0, 0, [0usize; 3]);
+    let t = Instant::now();
+    while t.elapsed().as_secs_f64() < 4.0 {
+        let states: Vec<bool> = pids.iter().map(|&p| !state(p).starts_with('T')).collect();
+        for (i, &r) in states.iter().enumerate() {
+            running[i] += r as usize;
+        }
+        together += (states.iter().filter(|&&r| r).count() == 3) as usize;
+        samples += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (i, &r) in running.iter().enumerate() {
+        let share = r as f64 / samples as f64;
+        assert!(
+            (0.2..0.45).contains(&share),
+            "process {i} ran {share:.2} of the time\n{}",
+            rig.log()
+        );
+    }
+    let all = together as f64 / samples as f64;
+    assert!(all < 0.1, "all three ran together {all:.2} of the time");
 }

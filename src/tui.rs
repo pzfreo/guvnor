@@ -492,8 +492,10 @@ fn zone(rpm: u32, target: u32, c: &Config) -> (Color, &'static str) {
         (HOT, "LIMIT")
     } else if rpm > target + c.rules.high_above {
         (WARN, "high")
+    } else if rpm + c.rules.high_above < target {
+        (OK, "below")
     } else {
-        (OK, "base")
+        (OK, "at target")
     }
 }
 
@@ -689,6 +691,20 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
         "run" => ("▶", format!("work running · pause in {left:.1} s"), OK),
         "pause" => ("⏸", format!("work paused · resumes in {left:.1} s"), WARN),
         "full" => ("▶", "work at full speed · nothing paused".into(), OK),
+        "stagger" => {
+            let work: Vec<&Work> = app.work.iter().filter(|w| w.proc.controlled()).collect();
+            let running = work.iter().filter(|w| !w.proc.stopped).count();
+            (
+                "▶",
+                format!(
+                    "staggered: each runs {:.0}% of every {} s · {running} of {} running",
+                    s.duty * 100.0,
+                    s.cycle,
+                    work.len()
+                ),
+                OK,
+            )
+        }
         _ => ("⏸", "throttling off (guvnor resume or p)".into(), WARN),
     };
     f.render_widget(
@@ -701,12 +717,13 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
     // This period as a strip: run part, pause part, and where we are now.
     let w = timeline.width as usize;
     if w > 0 && (s.phase == "run" || s.phase == "pause") {
+        let cycle = if s.cycle > 0.0 { s.cycle } else { s.period };
         let run_w = (s.duty * w as f64).round() as usize;
         let elapsed = match s.phase.as_str() {
-            "run" => s.duty * s.period - left,
-            _ => s.period - left,
+            "run" => s.duty * cycle - left,
+            _ => cycle - left,
         };
-        let now_x = ((elapsed / s.period).clamp(0.0, 1.0) * (w - 1) as f64) as usize;
+        let now_x = ((elapsed / cycle).clamp(0.0, 1.0) * (w - 1) as f64) as usize;
         let spans: Vec<Span> = (0..w)
             .map(|x| {
                 let c = if x < run_w { OK } else { WARN };
@@ -722,8 +739,10 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
-    let [rpm_area, duty_area] =
-        Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)]).areas(area);
+    let [rpm_area, lower] =
+        Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
+    let [duty_area, temp_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(lower);
     let now = state::now();
     let (samples, title): (Vec<Sample>, &str) = match &app.status {
         Some(s) if !s.history.is_empty() => (s.history.clone(), "Fan speed"),
@@ -797,9 +816,10 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
         Axis::default()
             .bounds([floor_rpm, top])
             .labels(
+                // Labels sit evenly up the axis, so they name evenly spaced values.
                 [
                     "off".to_string(),
-                    format!("{target:.0}"),
+                    format!("{:.0}", (floor_rpm + top) / 2.0),
                     format!("{top:.0}"),
                 ]
                 .map(|l| Span::styled(l, Style::new().fg(DIM))),
@@ -825,10 +845,7 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
             .style(Style::new().fg(DUTY))
             .data(&duty_pts),
     ])
-    .block(panel("Duty").title(key_line(&[(
-        "average share of each 10 s the work runs",
-        DUTY,
-    )])))
+    .block(panel("Duty").title(key_line(&[("average per 10 s", DUTY)])))
     .x_axis(x_axis)
     .y_axis(
         Axis::default()
@@ -838,6 +855,67 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
     )
     .legend_position(None);
     f.render_widget(duty_chart, duty_area);
+    draw_temps(f, temp_area, app, &samples, now, span);
+}
+
+/// The hottest die reading in each period, and the setpoint the temperature loop held.
+fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64, span: f64) {
+    let temps: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|s| s.temp.map(|t| (s.t - now, t)))
+        .collect();
+    let set: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|s| s.setpoint.map(|t| (s.t - now, t)))
+        .collect();
+    let block = panel("Die temperature").title(key_line(&[("hottest", HOT), ("setpoint", TARGET)]));
+    if temps.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let why = match &app.status {
+            Some(s) if s.control == "fans" => "Not used with control = \"fans\".",
+            Some(_) => "Collecting…",
+            None => "Appears while a governor runs.",
+        };
+        f.render_widget(Paragraph::new(why).fg(DIM), inner);
+        return;
+    }
+    let vals = temps.iter().chain(&set).map(|p| p.1);
+    let lo = (vals.clone().fold(f64::MAX, f64::min) / 5.0).floor() * 5.0 - 5.0;
+    let hi = (vals.fold(f64::MIN, f64::max) / 5.0).ceil() * 5.0 + 5.0;
+    let chart = Chart::new(vec![
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(TARGET))
+            .data(&set),
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(HOT))
+            .data(&temps),
+    ])
+    .block(block)
+    .x_axis(
+        Axis::default()
+            .bounds([-span, 0.0])
+            .labels(
+                [format!("-{:.0}m", span / 60.0), "now".into()]
+                    .map(|l| Span::styled(l, Style::new().fg(DIM))),
+            )
+            .style(Style::new().fg(DIM)),
+    )
+    .y_axis(
+        Axis::default()
+            .bounds([lo, hi])
+            .labels(
+                [lo, (lo + hi) / 2.0, hi]
+                    .map(|v| Span::styled(format!("{v:.0}°"), Style::new().fg(DIM))),
+            )
+            .style(Style::new().fg(DIM)),
+    )
+    .legend_position(None);
+    f.render_widget(chart, area);
 }
 
 fn draw_work(f: &mut Frame, area: Rect, app: &App) {
