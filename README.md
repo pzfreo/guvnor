@@ -73,8 +73,8 @@ an error. `guvnor config` prints them all with comments. In short:
   duty × 0.9; fans off (below 2000) +10 points every 3 periods; at base speed +5 points every 6;
   `floor` 0.2, `ceiling` 1.0; `cut_hold` and `relearn_every` (below).
 - `[work]`: `names` (whole process name, like `pgrep -x`; default the Rust/C toolchain), `exes`
-  (search in the executable's path; default `target/(release|debug)/`, i.e. built programs and test
-  binaries), `cmdlines` (search in the whole command line, like `pgrep -f`; empty by default), and
+  (search in the executable's path; default `/(release|debug)/`, i.e. built programs and test
+  binaries in `target/` or any other cargo `--target-dir`), `cmdlines` (search in the whole command line, like `pgrep -f`; empty by default), and
   `tree_names` / `tree_cmdlines` (that process and all its descendants).
 - `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
 

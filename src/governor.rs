@@ -234,6 +234,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     ));
 
     let mut next_outer = Instant::now();
+    let mut hot_at_floor = 0u32;
     while !STOP.load(Ordering::SeqCst) {
         if let Ok(Some(_)) = dog.try_wait() {
             log("watchdog exited; restarting it");
@@ -297,6 +298,24 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             out.rpm = smc.rpm();
             if !paused {
                 ctl.outer(out.rpm, out.target, out.ceiling);
+            }
+            // The die far above the setpoint with the work already at the floor for a minute:
+            // the heat is coming from something guvnor does not throttle. Say so once.
+            let starved = match (&ctl, out.temp) {
+                (Ctl::Temp(t, _), Some(temp)) => {
+                    !paused
+                        && t.duty() <= config.temperature.floor + 1e-9
+                        && temp > t.setpoint() + 10.0
+                }
+                _ => false,
+            };
+            hot_at_floor = if starved { hot_at_floor + 1 } else { 0 };
+            if hot_at_floor == 6 {
+                log(&format!(
+                    "warning: die {:.0} °C with the work at the floor for a minute: the heat comes from \
+                     processes guvnor does not match (see top, and [work] in the config)",
+                    out.temp.unwrap_or_default()
+                ));
             }
             if out.history.len() >= HISTORY {
                 out.history.pop_front();

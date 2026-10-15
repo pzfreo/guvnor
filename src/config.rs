@@ -166,7 +166,7 @@ impl Default for Work {
                 "cargo-clippy",
                 "clippy-driver",
             ]),
-            exes: s(&["target/(release|debug)/"]),
+            exes: s(&["/(release|debug)/"]),
             cmdlines: vec![],
             tree_names: vec![],
             tree_cmdlines: vec![],
@@ -308,8 +308,9 @@ relearn_every = 30    # rises stop just below the duty that last overshot; after
 [work]
 # Regexes on the whole process name (like pgrep -x).
 names = ["rustc", "cargo", "ld", "clang", "cc", "cargo-clippy", "clippy-driver"]
-# Regexes searched for in the executable's path: built programs and test binaries.
-exes = ["target/(release|debug)/"]
+# Regexes searched for in the executable's path: built programs and test binaries, in target/
+# or any other cargo --target-dir.
+exes = ["/(release|debug)/"]
 # Regexes searched for in the full command line (like pgrep -f). This also catches shells and
 # scripts that merely mention a path, so prefer exes.
 cmdlines = []

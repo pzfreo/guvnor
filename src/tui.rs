@@ -468,7 +468,9 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
         gauge,
     );
     let cap_text = match (s.temp, s.setpoint, s.cap) {
-        (Some(t), Some(sp), _) => format!("die {t:.0} °C, holding {sp:.0} °C · {} s cycle", s.cycle),
+        (Some(t), Some(sp), _) => {
+            format!("die {t:.0} °C, holding {sp:.0} °C · {} s cycle", s.cycle)
+        }
         (_, Some(sp), _) => format!("holding {sp:.0} °C · {} s cycle", s.cycle),
         (_, _, Some(c)) => format!("learned cap {:.0}%", c * 100.0),
         _ => "no cap learned".into(),
