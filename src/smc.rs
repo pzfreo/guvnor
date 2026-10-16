@@ -163,12 +163,15 @@ impl Smc {
             .collect()
     }
 
-    /// The hottest of these sensors, in °C.
-    pub fn hottest(&self, keys: &[[u8; 4]]) -> Option<f64> {
-        keys.iter()
+    /// The hottest of these sensors and their mean, in °C.
+    pub fn temps(&self, keys: &[[u8; 4]]) -> Option<(f64, f64)> {
+        let v: Vec<f64> = keys
+            .iter()
             .filter_map(|k| self.number(k))
             .filter(|v| *v > 5.0 && *v < 130.0)
-            .reduce(f64::max)
+            .collect();
+        let max = v.iter().copied().reduce(f64::max)?;
+        Some((max, v.iter().sum::<f64>() / v.len() as f64))
     }
 
     /// Each fan's (actual, maximum) rpm.

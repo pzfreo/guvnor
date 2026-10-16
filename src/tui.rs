@@ -25,6 +25,7 @@ const OK: Color = Color::Rgb(87, 211, 140);
 const WARN: Color = Color::Rgb(255, 196, 61);
 const HOT: Color = Color::Rgb(255, 99, 99);
 const DUTY: Color = Color::Rgb(199, 146, 255);
+const AVG: Color = Color::Rgb(255, 166, 87);
 
 const TARGET: Color = Color::Rgb(70, 140, 90);
 const HIGH_LINE: Color = Color::Rgb(150, 115, 30);
@@ -184,6 +185,7 @@ impl App {
                 duty: 1.0,
                 temp: None,
                 setpoint: None,
+                avg: None,
             });
         }
     }
@@ -1003,7 +1005,11 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
     );
     let cap_text = match (s.temp, s.setpoint, s.cap) {
         (Some(t), Some(sp), _) => {
-            format!("die {t:.0} °C, holding {sp:.0} °C · {} s cycle", s.cycle)
+            let avg = s.avg.map(|a| format!(" (avg {a:.0})")).unwrap_or_default();
+            format!(
+                "die {t:.0} °C{avg}, holding {sp:.0} °C · {} s cycle",
+                s.cycle
+            )
         }
         (_, Some(sp), _) => format!("holding {sp:.0} °C · {} s cycle", s.cycle),
         (_, _, Some(c)) => format!("learned cap {:.0}%", c * 100.0),
@@ -1201,7 +1207,15 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
         .iter()
         .filter_map(|s| s.setpoint.map(|t| (s.t - now, t)))
         .collect();
-    let block = panel("Die temperature").title(key_line(&[("hottest", HOT), ("setpoint", TARGET)]));
+    let avg: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|s| s.avg.map(|t| (s.t - now, t)))
+        .collect();
+    let block = panel("Die temperature").title(key_line(&[
+        ("hottest", HOT),
+        ("average", AVG),
+        ("setpoint", TARGET),
+    ]));
     if temps.is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1213,7 +1227,7 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
         f.render_widget(Paragraph::new(why).fg(DIM), inner);
         return;
     }
-    let vals = temps.iter().chain(&set).map(|p| p.1);
+    let vals = temps.iter().chain(&set).chain(&avg).map(|p| p.1);
     let lo = (vals.clone().fold(f64::MAX, f64::min) / 5.0).floor() * 5.0 - 5.0;
     let hi = (vals.fold(f64::MIN, f64::max) / 5.0).ceil() * 5.0 + 5.0;
     let chart = Chart::new(vec![
@@ -1222,6 +1236,11 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
             .graph_type(GraphType::Line)
             .style(Style::new().fg(TARGET))
             .data(&set),
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(AVG))
+            .data(&avg),
         Dataset::default()
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)

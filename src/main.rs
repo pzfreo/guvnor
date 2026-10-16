@@ -222,8 +222,9 @@ fn status(c: &config::Config) {
             let state = if s.paused {
                 "paused (throttling off)".to_string()
             } else {
+                let avg = s.avg.map(|a| format!(" (avg {a:.0})")).unwrap_or_default();
                 let die = match (s.temp, s.setpoint) {
-                    (Some(t), Some(sp)) => format!(", die {t:.0} °C holding {sp:.0} °C"),
+                    (Some(t), Some(sp)) => format!(", die {t:.0} °C{avg} holding {sp:.0} °C"),
                     _ => String::new(),
                 };
                 format!("duty {:.0}%{cap}{die}", s.duty * 100.0)

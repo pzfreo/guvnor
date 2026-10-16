@@ -97,6 +97,9 @@ pub struct Status {
     pub temp: Option<f64>,
     #[serde(default)]
     pub setpoint: Option<f64>,
+    /// The mean of the die sensors, latest reading.
+    #[serde(default)]
+    pub avg: Option<f64>,
     /// Seconds per duty cycle (the temperature loop's, or the period).
     #[serde(default)]
     pub cycle: f64,
@@ -111,6 +114,9 @@ pub struct Sample {
     pub temp: Option<f64>,
     #[serde(default)]
     pub setpoint: Option<f64>,
+    /// The mean of the die sensors, averaged over the period.
+    #[serde(default)]
+    pub avg: Option<f64>,
 }
 
 pub fn write_status(s: &Status) {

@@ -122,14 +122,14 @@ impl Ctl {
         }
     }
 
-    /// The temperature loop, once a cycle; returns the reading.
-    fn inner(&mut self, smc: &Smc, dt: f64, ceiling: f64) -> Option<f64> {
+    /// The temperature loop, once a cycle; returns the hottest reading and the mean.
+    fn inner(&mut self, smc: &Smc, dt: f64, ceiling: f64) -> Option<(f64, f64)> {
         match self {
             Ctl::Fans(_) => None,
             Ctl::Temp(t, keys) => {
-                let temp = smc.hottest(keys)?;
+                let (temp, avg) = smc.temps(keys)?;
                 t.inner(temp, dt, ceiling);
-                Some(temp)
+                Some((temp, avg))
             }
         }
     }
@@ -142,6 +142,14 @@ impl Ctl {
     }
 }
 
+/// A period's die readings: the hottest, and the sum and count of the means.
+#[derive(Default)]
+struct Temps {
+    max: Option<f64>,
+    sum: f64,
+    n: u32,
+}
+
 /// What the loop publishes for `guvnor status` and the dashboard.
 struct Publisher {
     history: VecDeque<Sample>,
@@ -149,9 +157,19 @@ struct Publisher {
     target: u32,
     ceiling: f64,
     temp: Option<f64>,
+    avg: Option<f64>,
 }
 
 impl Publisher {
+    /// Takes one cycle's die readings into the latest values and the period's figures.
+    fn read(&mut self, (t, avg): (f64, f64), period: &mut Temps) {
+        self.temp = Some(t);
+        self.avg = Some(avg);
+        period.max = Some(period.max.map_or(t, |m: f64| m.max(t)));
+        period.sum += avg;
+        period.n += 1;
+    }
+
     fn write(&self, ctl: &Ctl, cfg: &Config, phase: &str, secs: f64) {
         state::write_status(&state::Status {
             pid: std::process::id() as i32,
@@ -176,6 +194,7 @@ impl Publisher {
             },
             temp: self.temp,
             setpoint: ctl.setpoint(),
+            avg: self.avg,
             cycle: ctl.cycle(cfg),
         });
     }
@@ -209,6 +228,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         target,
         ceiling,
         temp: None,
+        avg: None,
     };
     let how = match &ctl {
         Ctl::Fans(_) => format!(
@@ -233,8 +253,8 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     // The duty averaged over the period, for the history: in temperature mode it moves every
     // cycle, so one reading a period would be noise.
     let (mut duty_sum, mut duty_secs) = (0.0f64, 0.0f64);
-    // The hottest die reading in the period, for the history.
-    let mut temp_max: Option<f64> = None;
+    // The hottest die reading in the period and the mean, for the history.
+    let mut temps = Temps::default();
     // Each process's place in the cycle (0..1), kept for as long as it is work, so its pauses
     // stay bounded; and the processes guvnor holds stopped right now.
     let mut offsets: HashMap<i32, f64> = HashMap::new();
@@ -336,11 +356,14 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 } else {
                     ctl.duty()
                 },
-                temp: temp_max.or(out.temp),
+                temp: temps.max.or(out.temp),
                 setpoint: ctl.setpoint(),
+                avg: (temps.n > 0)
+                    .then(|| temps.sum / temps.n as f64)
+                    .or(out.avg),
             });
             (duty_sum, duty_secs) = (0.0, 0.0);
-            temp_max = None;
+            temps = Temps::default();
         }
 
         let cycle = ctl.cycle(&config);
@@ -358,9 +381,8 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 dog.beat();
                 std::thread::sleep(Duration::from_millis(50));
             }
-            if !paused && let Some(t) = ctl.inner(&smc, cycle, out.ceiling) {
-                out.temp = Some(t);
-                temp_max = Some(temp_max.map_or(t, |m: f64| m.max(t)));
+            if !paused && let Some(r) = ctl.inner(&smc, cycle, out.ceiling) {
+                out.read(r, &mut temps);
             }
             continue;
         }
@@ -450,9 +472,8 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             // Read the die once a cycle; without staggering, at the end of the run, its hottest.
             if !read && phase >= duty {
                 read = true;
-                if let Some(t) = ctl.inner(&smc, cycle, out.ceiling) {
-                    out.temp = Some(t);
-                    temp_max = Some(temp_max.map_or(t, |m: f64| m.max(t)));
+                if let Some(r) = ctl.inner(&smc, cycle, out.ceiling) {
+                    out.read(r, &mut temps);
                 }
             }
             if !stagger_phase && !wrote_pause && phase >= duty {

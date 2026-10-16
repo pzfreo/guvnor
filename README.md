@@ -37,7 +37,7 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
   zone: off, base, high, LIMIT;
 - the duty, the learned cap and the ceiling, and where the current period is: work running or
   paused, with a countdown;
-- the fan speed, the duty and the die temperature (hottest reading each period, with the
+- the fan speed, the duty and the die temperature (hottest reading each period, the mean of the die sensors, and the
   setpoint) over the last hour, starting at 5 minutes and widening as history builds;
 - your work grouped by **owner**, one line each, busiest first, with its total CPU and how many of its processes rules already control. An owner is
   what you started: a Claude Code session or a command in a terminal tab (the first process below
