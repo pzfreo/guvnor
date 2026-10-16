@@ -476,6 +476,9 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 heat: out.heat,
                 predicted: out.predicted,
             });
+            if let Some(last) = out.history.back() {
+                state::append_trace(last, out.target, !paused);
+            }
             (duty_sum, duty_secs) = (0.0, 0.0);
             temps = Temps::default();
         }

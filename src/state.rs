@@ -156,6 +156,39 @@ pub struct Pins {
     pub owners: Vec<(i32, u64)>,
 }
 
+/// A long record of the periods, for working out how this machine's fans behave: one line per
+/// period in trace.csv. Past 8 MB (about two weeks) it becomes trace.1.csv, replacing the one
+/// before.
+pub fn append_trace(s: &Sample, target: u32, throttling: bool) {
+    const HEADER: &str =
+        "time,rpm,target,heat,predicted,hottest,average,setpoint,duty,load,throttling\n";
+    let path = dir().join("trace.csv");
+    if fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) {
+        let _ = fs::rename(&path, dir().join("trace.1.csv"));
+    }
+    let new = !path.exists();
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let o = |v: Option<f64>| v.map(|v| format!("{v:.2}")).unwrap_or_default();
+    let line = format!(
+        "{}{:.1},{},{},{},{},{},{},{},{:.3},{},{}\n",
+        if new { HEADER } else { "" },
+        s.t,
+        s.rpm,
+        target,
+        o(s.heat),
+        o(s.predicted),
+        o(s.temp),
+        o(s.avg),
+        o(s.setpoint),
+        s.duty,
+        o(s.load),
+        throttling as u8
+    );
+    let _ = f.write_all(line.as_bytes());
+}
+
 /// The fan model, kept across restarts: it is this machine's.
 pub fn read_model() -> Option<crate::model::Model> {
     serde_json::from_slice(&fs::read(dir().join("model.json")).ok()?).ok()

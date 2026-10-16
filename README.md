@@ -115,7 +115,9 @@ an error. `guvnor config` prints them all with comments. In short:
   predictions and they are within 250 rpm on average and clearly better than assuming the fans
   stay as they are, the fan rules act on the predicted speed
   when it is higher than the actual one, so the setpoint stops climbing before the fans
-  overshoot. `"record"` only learns and shows it; `"off"` does neither.
+  overshoot. `"record"` only learns and shows it; `"off"` does neither. Whatever the mode, each period is also appended to
+  `trace.csv` in the state directory (about 0.5 MB a day; past 8 MB it moves to `trace.1.csv`),
+  a record of how this machine's fans behave, for judging models against.
 
 The governor notices a changed config at the next period and applies it, logging `config
 reloaded`. A config with an error is logged and ignored, and the previous settings stay.
