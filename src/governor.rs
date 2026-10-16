@@ -1,8 +1,9 @@
 //! `guvnor run`: the control loop.
 
-use crate::config::{Config, Control};
+use crate::config::{Config, Control, LearnMode};
 use crate::controller::Controller;
 use crate::log;
+use crate::model::Model;
 use crate::power::Power;
 use crate::procs::{self, Matcher};
 use crate::smc::Smc;
@@ -138,13 +139,20 @@ impl Ctl {
         }
     }
 
-    /// The fan rules, once a period.
-    fn outer(&mut self, rpm: u32, target: u32, ceiling: f64) {
+    /// The fan rules, once a period, on `used`: the fan speed, or the predicted one when that
+    /// is higher and the model is trusted.
+    fn outer(&mut self, rpm: u32, used: u32, target: u32, ceiling: f64) {
+        let fan = if used > rpm {
+            format!("fan {rpm} rpm (predicted {used})")
+        } else {
+            format!("fan {rpm} rpm")
+        };
+        let rpm = used;
         match self {
             Ctl::Fans(c) => {
                 if let Some(ch) = c.update(rpm, target, ceiling) {
                     log(&format!(
-                        "fan {rpm} rpm: duty {} -> {} ({:?})",
+                        "{fan}: duty {} -> {} ({:?})",
                         pct(ch.old),
                         pct(ch.new),
                         ch.reason
@@ -154,7 +162,7 @@ impl Ctl {
             Ctl::Temp(t, _) => {
                 if let Some(ch) = t.outer(rpm, target) {
                     log(&format!(
-                        "fan {rpm} rpm: setpoint {:.0} -> {:.0} °C ({:?}), duty {}",
+                        "{fan}: setpoint {:.0} -> {:.0} °C ({:?}), duty {}",
                         ch.old,
                         ch.new,
                         ch.reason,
@@ -209,6 +217,9 @@ struct Publisher {
     ceiling: f64,
     temp: Option<f64>,
     avg: Option<f64>,
+    heat: Option<f64>,
+    predicted: Option<f64>,
+    model: Option<String>,
 }
 
 impl Publisher {
@@ -247,6 +258,7 @@ impl Publisher {
             setpoint: ctl.setpoint(),
             avg: self.avg,
             cycle: ctl.cycle(cfg),
+            model: self.model.clone(),
         });
     }
 }
@@ -280,7 +292,24 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         ceiling,
         temp: None,
         avg: None,
+        heat: None,
+        predicted: None,
+        model: None,
     };
+    // The fan model: what measures the heat here, and what was learned before.
+    let input = if smc.number(b"PSTR").is_some_and(|w| w > 0.0) {
+        Some("PSTR")
+    } else if matches!(ctl, Ctl::Temp(..)) {
+        Some("die")
+    } else {
+        None
+    };
+    let mut model = input.map(|i| {
+        state::read_model()
+            .filter(|m| m.input == i)
+            .unwrap_or_else(|| Model::new(i))
+    });
+    let mut observed = 0u32;
     let how = match &ctl {
         Ctl::Fans(_) => format!(
             "fan rules, duty {} of each {} s",
@@ -377,8 +406,37 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 ));
             }
             out.rpm = smc.rpm();
+            let period_avg = (temps.n > 0)
+                .then(|| temps.sum / temps.n as f64)
+                .or(out.avg);
+            // Learn from every period, throttled or not; act on the prediction once it is good.
+            let mut rpm_for_rules = out.rpm;
+            (out.heat, out.predicted, out.model) = (None, None, None);
+            if let Some(m) = model
+                .as_mut()
+                .filter(|_| config.learn.mode != LearnMode::Off)
+            {
+                let x = match m.input.as_str() {
+                    "die" => period_avg,
+                    _ => smc.number(b"PSTR"),
+                };
+                if let Some(x) = x {
+                    m.observe(state::now(), x, out.rpm, config.period);
+                    out.heat = Some(x);
+                    out.predicted = m.predict();
+                    let acting = config.learn.mode == LearnMode::Auto;
+                    if acting && m.ready() {
+                        rpm_for_rules = rpm_for_rules.max(out.predicted.unwrap_or(0.0) as u32);
+                    }
+                    out.model = Some(m.summary(acting));
+                    observed += 1;
+                    if observed.is_multiple_of(30) {
+                        state::write_model(m);
+                    }
+                }
+            }
             if !paused {
-                ctl.outer(out.rpm, out.target, out.ceiling);
+                ctl.outer(out.rpm, rpm_for_rules, out.target, out.ceiling);
             }
             // The die far above the setpoint with the work already at the floor for a minute:
             // the heat is coming from something guvnor does not throttle. Say so once.
@@ -413,10 +471,10 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 },
                 temp: temps.max.or(out.temp),
                 setpoint: ctl.setpoint(),
-                avg: (temps.n > 0)
-                    .then(|| temps.sum / temps.n as f64)
-                    .or(out.avg),
+                avg: period_avg,
                 load: state::load(),
+                heat: out.heat,
+                predicted: out.predicted,
             });
             (duty_sum, duty_secs) = (0.0, 0.0);
             temps = Temps::default();
@@ -569,6 +627,9 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     }
 
     let n = continue_all(&matcher);
+    if let Some(m) = &model {
+        state::write_model(m);
+    }
     log(&format!("exit: continued {n} work processes"));
     dog.stop();
     Ok(())

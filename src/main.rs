@@ -5,6 +5,7 @@ mod config;
 mod controller;
 mod governor;
 mod launchd;
+mod model;
 mod power;
 mod procs;
 #[cfg(test)]
@@ -233,6 +234,9 @@ fn status(c: &config::Config) {
                 "governor: running (pid {}), {state}, target {} rpm, period {} s",
                 s.pid, s.target, s.period
             );
+            if let Some(m) = &s.model {
+                println!("model: {m}");
+            }
         }
         None => println!(
             "governor: not running{}",

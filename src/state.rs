@@ -103,6 +103,9 @@ pub struct Status {
     /// Seconds per duty cycle (the temperature loop's, or the period).
     #[serde(default)]
     pub cycle: f64,
+    /// The fan model's state, one line.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -120,6 +123,11 @@ pub struct Sample {
     /// The 1-minute load average.
     #[serde(default)]
     pub load: Option<f64>,
+    /// The fan model's input (watts, or °C) and its fan speed predicted a minute ahead.
+    #[serde(default)]
+    pub heat: Option<f64>,
+    #[serde(default)]
+    pub predicted: Option<f64>,
 }
 
 /// The 1-minute load average.
@@ -146,6 +154,15 @@ pub struct Pins {
     pub off: Vec<(i32, u64)>,
     /// Owners whose work is controlled (see `procs::owners`).
     pub owners: Vec<(i32, u64)>,
+}
+
+/// The fan model, kept across restarts: it is this machine's.
+pub fn read_model() -> Option<crate::model::Model> {
+    serde_json::from_slice(&fs::read(dir().join("model.json")).ok()?).ok()
+}
+
+pub fn write_model(m: &crate::model::Model) {
+    let _ = write_atomic("model.json", &serde_json::to_vec(m).unwrap());
 }
 
 pub fn read_pins() -> Pins {

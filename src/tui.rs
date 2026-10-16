@@ -27,6 +27,7 @@ const HOT: Color = Color::Rgb(255, 99, 99);
 const DUTY: Color = Color::Rgb(199, 146, 255);
 const AVG: Color = Color::Rgb(255, 166, 87);
 const LOAD: Color = Color::Rgb(120, 220, 200);
+const PREDICT: Color = Color::Rgb(160, 120, 220);
 
 const TARGET: Color = Color::Rgb(70, 140, 90);
 const HIGH_LINE: Color = Color::Rgb(150, 115, 30);
@@ -188,6 +189,8 @@ impl App {
                 setpoint: None,
                 avg: None,
                 load: state::load(),
+                heat: None,
+                predicted: None,
             });
         }
     }
@@ -1108,11 +1111,21 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|s| s.rpm as f64)
         .fold(target + rules.limit_above as f64 + 100.0, f64::max);
-    let top = (peak / 100.0).ceil() * 100.0;
     let rpm_pts: Vec<(f64, f64)> = samples
         .iter()
         .map(|s| (s.t - now, (s.rpm as f64).max(floor_rpm)))
         .collect();
+    // The model's prediction, drawn where it was made: it should lead the fans by a minute.
+    let pred_pts: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|s| s.predicted.map(|p| (s.t - now, p.max(floor_rpm))))
+        .collect();
+    let peak = pred_pts.iter().map(|p| p.1).fold(peak, f64::max);
+    let top = (peak / 100.0).ceil() * 100.0;
+    let title = match app.status.as_ref().and_then(|s| s.model.as_ref()) {
+        Some(m) if title == "Fan speed" => format!("Fan speed · model {m}"),
+        _ => title.to_string(),
+    };
     let line = |y: f64| vec![(-span, y), (0.0, y)];
     let (t_line, h_line, l_line) = (
         line(target),
@@ -1149,14 +1162,21 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
             .style(Style::new().fg(TARGET))
             .data(&t_line),
         Dataset::default()
+            .name("predicted")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(PREDICT))
+            .data(&pred_pts),
+        Dataset::default()
             .name("rpm")
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::new().fg(ACCENT))
             .data(&rpm_pts),
     ])
-    .block(panel(title).title(key_line(&[
+    .block(panel(&title).title(key_line(&[
         ("rpm", ACCENT),
+        ("predicted", PREDICT),
         ("target", TARGET),
         ("high", HIGH_LINE),
         ("limit", LIMIT_LINE),

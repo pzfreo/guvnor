@@ -106,6 +106,14 @@ an error. `guvnor config` prints them all with comments. In short:
   and all its descendants), `exclude_names` (never, whatever else matches), and `idle_below` (1: work using less than 1% of a core over the last 10 s, counting only the time it was let run, is left running, since pausing it saves no heat; a new process is judged by its average since it started; 0 pauses all work). `guvnor config`
   shows examples for Rust, C/C++, Python and media tools.
 - `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
+- `[learn]`: `mode` (`"auto"`). The fans follow the heat being produced, smoothed over about a
+  minute and about a minute late. guvnor learns this machine's curve from heat (CPU power,
+  `PSTR`, or the mean die temperature where there is no power reading) to fan speed, keeps it in
+  `model.json` in the state directory, and keeps adapting it. It predicts the fans a minute ahead
+  (the dashboard draws the prediction). With `"auto"`, once it has checked an hour of
+  predictions and they are within 250 rpm on average, the fan rules act on the predicted speed
+  when it is higher than the actual one, so the setpoint stops climbing before the fans
+  overshoot. `"record"` only learns and shows it; `"off"` does neither.
 
 The governor notices a changed config at the next period and applies it, logging `config
 reloaded`. A config with an error is logged and ignored, and the previous settings stay.
