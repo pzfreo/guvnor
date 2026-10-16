@@ -30,13 +30,17 @@ pub struct Model {
     bins: BTreeMap<i32, (f64, u32)>,
     /// Predictions checked against what the fans then did.
     pub checked: u32,
-    /// The mean error of those predictions, recently weighted, in rpm.
+    /// The mean error of those predictions, recently weighted, in rpm...
     pub err: f64,
+    /// ...and of the guess that the fans stay as they are, which the model has to beat.
+    #[serde(default)]
+    pub still: f64,
     #[serde(skip)]
     smoothed: Option<f64>,
-    /// Recent (time, smoothed input, prediction made then), awaiting the fan speed AHEAD later.
+    /// Recent (time, smoothed input, prediction made then, fan speed then), awaiting the fan
+    /// speed AHEAD later.
     #[serde(skip)]
-    pending: VecDeque<(f64, f64, Option<f64>)>,
+    pending: VecDeque<(f64, f64, Option<f64>, u32)>,
 }
 
 impl Model {
@@ -60,11 +64,12 @@ impl Model {
         while self.pending.front().is_some_and(|p| p.0 <= t - AHEAD) {
             due = self.pending.pop_front();
         }
-        if let Some((_, old, predicted)) = due {
+        if let Some((_, old, predicted, then)) = due {
             let rpm = rpm as f64;
             if let Some(p) = predicted {
                 let w = 1.0 / (self.checked + 1).min(SETTLED) as f64;
                 self.err += w * ((p - rpm).abs() - self.err);
+                self.still += w * ((then as f64 - rpm).abs() - self.still);
                 self.checked = self.checked.saturating_add(1);
             }
             let bin = self
@@ -79,7 +84,7 @@ impl Model {
             };
             bin.0 += w * (rpm - bin.0);
         }
-        self.pending.push_back((t, s, self.curve(s)));
+        self.pending.push_back((t, s, self.curve(s), rpm));
     }
 
     /// The fan speed expected AHEAD from now.
@@ -87,9 +92,10 @@ impl Model {
         self.curve(self.smoothed?)
     }
 
-    /// Learned enough, and predicting well enough, to act on.
+    /// Learned enough, and predicting well enough, to act on: close, and clearly better than
+    /// assuming the fans stay as they are.
     pub fn ready(&self) -> bool {
-        self.checked >= READY_SAMPLES && self.err <= READY_ERR
+        self.checked >= READY_SAMPLES && self.err <= READY_ERR && self.err < 0.8 * self.still
     }
 
     /// The curve at `x`: more heat never means slower fans, so each bin counts as at least the
@@ -120,7 +126,7 @@ impl Model {
     /// One line for the dashboard and `guvnor status`.
     pub fn summary(&self, acting: bool) -> String {
         let fit = if self.checked > 0 {
-            format!(", ±{:.0} rpm", self.err)
+            format!(", ±{:.0} rpm (no change ±{:.0})", self.err, self.still)
         } else {
             String::new()
         };
@@ -204,6 +210,23 @@ mod tests {
         let back: Model = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.curve(40.0), m.curve(40.0));
         assert_eq!(back.input, "PSTR");
+    }
+
+    #[test]
+    fn not_ready_unless_it_beats_assuming_no_change() {
+        // Fans that hold still whatever the heat does: the model has nothing to add.
+        let mut m = Model::new("PSTR");
+        let mut t = 0.0;
+        for i in 0..800 {
+            let heat = if (i / 7) % 2 == 0 { 30.0 } else { 60.0 };
+            m.observe(t, heat, 4000 + (i % 3) * 10, 10.0);
+            t += 10.0;
+        }
+        assert!(
+            m.checked >= READY_SAMPLES && !m.ready(),
+            "{}",
+            m.summary(true)
+        );
     }
 
     #[test]

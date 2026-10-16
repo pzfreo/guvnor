@@ -111,7 +111,8 @@ an error. `guvnor config` prints them all with comments. In short:
   `PSTR`, or the mean die temperature where there is no power reading) to fan speed, keeps it in
   `model.json` in the state directory, and keeps adapting it. It predicts the fans a minute ahead
   (the dashboard draws the prediction). With `"auto"`, once it has checked an hour of
-  predictions and they are within 250 rpm on average, the fan rules act on the predicted speed
+  predictions and they are within 250 rpm on average and clearly better than assuming the fans
+  stay as they are, the fan rules act on the predicted speed
   when it is higher than the actual one, so the setpoint stops climbing before the fans
   overshoot. `"record"` only learns and shows it; `"off"` does neither.
 
