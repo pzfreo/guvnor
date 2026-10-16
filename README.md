@@ -103,7 +103,7 @@ an error. `guvnor config` prints them all with comments. In short:
   under it), `names` (whole process name, like `pgrep -x`), `exes` (search
   in the executable's path, e.g. `/(release|debug)/` for anything cargo builds), `cmdlines`
   (search in the whole command line, like `pgrep -f`), `tree_names` / `tree_cmdlines` (that process
-  and all its descendants), and `exclude_names` (never, whatever else matches). `guvnor config`
+  and all its descendants), `exclude_names` (never, whatever else matches), and `idle_below` (1: work using less than 1% of a core over the last 10 s, counting only the time it was let run, is left running, since pausing it saves no heat; a new process is judged by its average since it started; 0 pauses all work). `guvnor config`
   shows examples for Rust, C/C++, Python and media tools.
 - `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
 

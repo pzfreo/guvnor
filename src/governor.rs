@@ -22,6 +22,49 @@ extern "C" fn on_signal(_: i32) {
 
 /// Samples kept for the dashboard: an hour at the default period.
 const HISTORY: usize = 360;
+/// Work is paused while it has been busy within this long.
+const IDLE_AFTER: Duration = Duration::from_secs(10);
+
+/// Which work is busy enough to pause: CPU per process, measured cycle to cycle over the time
+/// it was let run, so a busy process held at a low duty still counts as busy.
+#[derive(Default)]
+struct Activity {
+    seen: HashMap<i32, Seen>,
+}
+
+struct Seen {
+    ns: u64,
+    at: Instant,
+    busy_at: Option<Instant>,
+}
+
+impl Activity {
+    /// Takes a reading (total CPU ns at `now`, having run `ran` of the time since the last one)
+    /// and says whether to pause the process. A process seen for the first time is judged by
+    /// its average since it started, `age` seconds ago; under a second old, starting up skews
+    /// that, so it runs until the next reading.
+    fn busy(&mut self, pid: i32, ns: u64, now: Instant, ran: f64, below: f64, age: f64) -> bool {
+        let pct = |used: u64, secs: f64| used as f64 / 1e9 / secs * 100.0;
+        let s = self.seen.entry(pid).or_insert_with(|| Seen {
+            ns,
+            at: now,
+            busy_at: (age >= 1.0 && pct(ns, age) >= below).then_some(now),
+        });
+        let dt = now.duration_since(s.at).as_secs_f64();
+        if dt > 0.0 && pct(ns.saturating_sub(s.ns), dt * ran.max(0.05)) >= below {
+            s.busy_at = Some(now);
+        }
+        s.ns = ns;
+        s.at = now;
+        below <= 0.0
+            || s.busy_at
+                .is_some_and(|t| now.duration_since(t) < IDLE_AFTER)
+    }
+
+    fn retain(&mut self, keep: impl Fn(i32) -> bool) {
+        self.seen.retain(|&pid, _| keep(pid));
+    }
+}
 
 fn pct(d: f64) -> String {
     format!("{:.0}%", d * 100.0)
@@ -260,6 +303,10 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     let mut offsets: HashMap<i32, f64> = HashMap::new();
     let mut next_offset = 0.0f64;
     let mut held: HashSet<i32> = HashSet::new();
+    let mut activity = Activity::default();
+    // The duty last cycle's paused work ran at, and which work that was; the rest ran freely.
+    let mut ran = 1.0f64;
+    let mut throttled: HashSet<i32> = HashSet::new();
     while !STOP.load(Ordering::SeqCst) {
         if dog.exited() {
             log("watchdog exited; restarting it");
@@ -374,6 +421,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         // mode the die is read once a cycle to know when to start.
         if paused || duty >= 1.0 - 1e-9 {
             continue_held(&mut held);
+            throttled.clear();
             out.write(&ctl, &config, if paused { "off" } else { "full" }, cycle);
             let end = Instant::now() + Duration::from_secs_f64(cycle);
             while Instant::now() < end && !STOP.load(Ordering::SeqCst) && state::paused() == paused
@@ -400,11 +448,28 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 ));
             }
         }
+        // Only busy work is paused; idle work (cpu_ns unreadable counts as busy) runs on.
+        let now = Instant::now();
+        let epoch_us = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        activity.retain(|pid| work.iter().any(|p| p.pid == pid));
         let pids: Vec<i32> = work
             .iter()
             .filter(|p| !p.stopped || held.contains(&p.pid))
+            .filter(|p| match procs::cpu_ns(p.pid) {
+                Some(ns) => {
+                    let ran = if throttled.contains(&p.pid) { ran } else { 1.0 };
+                    let age = epoch_us.saturating_sub(p.start) as f64 / 1e6;
+                    activity.busy(p.pid, ns, now, ran, config.work.idle_below, age)
+                }
+                None => true,
+            })
             .map(|p| p.pid)
             .collect();
+        ran = duty;
+        throttled = pids.iter().copied().collect();
         // Anything that is no longer work (exited, or no longer matched) runs again.
         for pid in held.clone() {
             if !pids.contains(&pid) {
@@ -493,4 +558,40 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     log(&format!("exit: continued {n} work processes"));
     dog.stop();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_work_is_left_running_and_busy_work_paused() {
+        let mut a = Activity::default();
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        // First seen: judged by its average since it started. A helper that used 0.2 s in an
+        // hour is idle at once; a compiler that used 3 s in 2 s is busy.
+        assert!(!a.busy(1, 200_000_000, at(0.0), 1.0, 1.0, 3600.0));
+        assert!(a.busy(2, 3_000_000_000, at(0.0), 1.0, 1.0, 2.0));
+        // Then 0.1% of a core, running freely: idle once IDLE_AFTER has passed.
+        let mut ns = 3_000_000_000;
+        for i in 1..=12 {
+            ns += 1_000_000;
+            let busy = a.busy(2, ns, at(i as f64), 1.0, 1.0, 0.0);
+            assert_eq!(busy, i < 10, "at {i} s");
+        }
+        // The idle helper wakes up: 50% of a core is busy at the next reading.
+        assert!(a.busy(1, 700_000_000, at(1.0), 1.0, 1.0, 0.0));
+        // Held at 5% duty, it used 0.05 s of CPU in a second: 100% of the time it ran.
+        assert!(a.busy(3, 2_000_000_000, at(0.0), 1.0, 1.0, 2.0));
+        for i in 1..=30 {
+            assert!(a.busy(3, i * 50_000_000, at(i as f64), 0.05, 1.0, 0.0));
+        }
+        // Under a second old: starting up is not busy; it is measured next time.
+        assert!(!a.busy(5, 2_000_000, at(0.0), 1.0, 1.0, 0.05));
+        assert!(a.busy(5, 900_000_000, at(1.0), 1.0, 1.0, 0.0));
+        // idle_below = 0: everything is paused.
+        assert!(a.busy(4, 0, at(0.0), 1.0, 0.0, 3600.0));
+        assert!(a.busy(4, 0, at(60.0), 1.0, 0.0, 0.0));
+    }
 }

@@ -114,6 +114,9 @@ pub struct Work {
     pub tree_cmdlines: Vec<String>,
     /// Regexes on the whole process name: never work, whatever else matches.
     pub exclude_names: Vec<String>,
+    /// Work using less CPU than this (percent of one core, over the last 10 s, counting only
+    /// the time it was let run) is not paused: pausing it saves no heat. 0 pauses all work.
+    pub idle_below: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -174,6 +177,7 @@ impl Default for Work {
             tree_names: vec![],
             tree_cmdlines: vec![],
             exclude_names: vec![],
+            idle_below: 1.0,
         }
     }
 }
@@ -272,6 +276,7 @@ impl Config {
         {
             regex::Regex::new(p).map_err(|e| format!("bad regex {p:?}: {e}"))?;
         }
+        check(w.idle_below >= 0.0, "work.idle_below must be >= 0")?;
         Ok(())
     }
 
@@ -341,6 +346,10 @@ tree_names = []
 tree_cmdlines = []
 # Never work, whatever else matches (whole process name).
 exclude_names = []
+# Work using less than this percentage of one core is left running: pausing an idle process
+# (a session's helper servers, a shell waiting on its child) saves no heat but delays it.
+# 0 pauses all work.
+idle_below = 1.0
 
 # On battery: cap the duty, lower the target, or both. Uncomment to enable.
 # [battery]

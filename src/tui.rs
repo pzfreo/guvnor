@@ -1314,6 +1314,8 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
             DIM
         }
     };
+    // Controlled but left running: the governor does not pause work this idle.
+    let idle = |w: &Work| !w.proc.stopped && w.cpu < app.config.work.idle_below;
     let mut owner = "";
     let rows: Vec<Row> = app
         .items
@@ -1346,9 +1348,10 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
                 let (n, stopped) = app
                     .work
                     .iter()
-                    .filter(|w| w.proc.owner == o.pid && w.proc.controlled())
+                    .filter(|w| w.proc.owner == o.pid && w.proc.controlled() && !idle(w))
                     .fold((0, 0), |(n, s), w| (n + 1, s + w.proc.stopped as usize));
                 let (state, color) = match (n, stopped) {
+                    (0, _) if o.controlled > 0 => ("◌ idle".to_string(), DIM),
                     (0, _) => ("○ free".to_string(), DIM),
                     (n, s) if s == n => ("⏸ paused".to_string(), WARN),
                     (_, 0) => ("▶ running".to_string(), OK),
@@ -1376,6 +1379,7 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
                     "" => ("○ free", DIM),
                     "excluded" | "released" => ("⊘ excluded", DIM),
                     _ if p.stopped => ("⏸ paused", WARN),
+                    _ if idle(w) => ("◌ idle", DIM),
                     _ => ("▶ running", OK),
                 };
                 // What controls it: its owner, just this process, or a rule for its kind.

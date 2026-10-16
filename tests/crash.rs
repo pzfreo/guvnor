@@ -1,6 +1,7 @@
 //! Crash safety against the real binary: whatever happens to the governor during a pause, no
 //! work process stays stopped. Each test throttles only its own `sleep` process, with its own
-//! state directory and config (period 2 s, duty between 0.2 and 0.3, so it pauses every period).
+//! state directory and config (period 2 s, duty between 0.2 and 0.3, so it pauses every period;
+//! idle_below = 0, as the sleeping victim would otherwise be left running as idle).
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -36,7 +37,7 @@ impl Rig {
         let pattern = format!("^/bin/sleep {}$", secs.replace('.', "\\\\."));
         std::fs::write(
             dir.join("config.toml"),
-            format!("period = {PERIOD}\n{top}\n[rules]\nfloor = {FLOOR}\n{rules}\n[work]\nnames = []\nexes = []\ncmdlines = [\"{pattern}\"]\n"),
+            format!("period = {PERIOD}\n{top}\n[rules]\nfloor = {FLOOR}\n{rules}\n[work]\nnames = []\nexes = []\ncmdlines = [\"{pattern}\"]\nidle_below = 0\n"),
         )
         .unwrap();
         Rig {
@@ -290,6 +291,20 @@ fn at_full_duty_nothing_is_stopped() {
 }
 
 #[test]
+fn idle_work_is_left_running() {
+    let mut rig = Rig::new("idle", THROTTLE);
+    let cfg = rig.dir.join("config.toml");
+    let text = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("idle_below = 0\n", "idle_below = 1\n");
+    std::fs::write(&cfg, text).unwrap();
+    rig.start();
+    // The sleeping victim has used no CPU since it started, so it is never paused.
+    rig.never_stopped(3.0 * PERIOD);
+    assert!(rig.log().contains("start:"), "{}", rig.log());
+}
+
+#[test]
 fn only_one_governor_runs() {
     let mut rig = Rig::new("lock", THROTTLE);
     rig.start();
@@ -422,7 +437,7 @@ fn staggered_processes_take_turns() {
     let pattern = format!("^/bin/sleep {}", rig.victim_secs().replace('.', "\\\\."));
     std::fs::write(
         rig.dir.join("config.toml"),
-        format!("period = 1.0\ncontrol = \"fans\"\nstagger = true\n[rules]\nfloor = 0.3\nceiling = 0.3\n[work]\ncmdlines = [\"{pattern}\"]\n"),
+        format!("period = 1.0\ncontrol = \"fans\"\nstagger = true\n[rules]\nfloor = 0.3\nceiling = 0.3\n[work]\ncmdlines = [\"{pattern}\"]\nidle_below = 0\n"),
     )
     .unwrap();
     rig.start();
