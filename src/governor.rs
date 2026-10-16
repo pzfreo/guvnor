@@ -416,6 +416,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 avg: (temps.n > 0)
                     .then(|| temps.sum / temps.n as f64)
                     .or(out.avg),
+                load: state::load(),
             });
             (duty_sum, duty_secs) = (0.0, 0.0);
             temps = Temps::default();

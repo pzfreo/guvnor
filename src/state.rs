@@ -117,6 +117,15 @@ pub struct Sample {
     /// The mean of the die sensors, averaged over the period.
     #[serde(default)]
     pub avg: Option<f64>,
+    /// The 1-minute load average.
+    #[serde(default)]
+    pub load: Option<f64>,
+}
+
+/// The 1-minute load average.
+pub fn load() -> Option<f64> {
+    let mut l = [0f64; 3];
+    (unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } > 0).then_some(l[0])
 }
 
 pub fn write_status(s: &Status) {

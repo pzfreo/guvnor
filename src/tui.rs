@@ -26,6 +26,7 @@ const WARN: Color = Color::Rgb(255, 196, 61);
 const HOT: Color = Color::Rgb(255, 99, 99);
 const DUTY: Color = Color::Rgb(199, 146, 255);
 const AVG: Color = Color::Rgb(255, 166, 87);
+const LOAD: Color = Color::Rgb(120, 220, 200);
 
 const TARGET: Color = Color::Rgb(70, 140, 90);
 const HIGH_LINE: Color = Color::Rgb(150, 115, 30);
@@ -186,6 +187,7 @@ impl App {
                 temp: None,
                 setpoint: None,
                 avg: None,
+                load: state::load(),
             });
         }
     }
@@ -1080,8 +1082,12 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
 fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
     let [rpm_area, lower] =
         Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
-    let [duty_area, temp_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(lower);
+    let [duty_area, load_area, temp_area] = Layout::horizontal([
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+    ])
+    .areas(lower);
     let now = state::now();
     let (samples, title): (Vec<Sample>, &str) = match &app.status {
         Some(s) if !s.history.is_empty() => (s.history.clone(), "Fan speed"),
@@ -1185,7 +1191,7 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
             .data(&duty_pts),
     ])
     .block(panel("Duty").title(key_line(&[("average per 10 s", DUTY)])))
-    .x_axis(x_axis)
+    .x_axis(short_axis(span))
     .y_axis(
         Axis::default()
             .bounds([0.0, 100.0])
@@ -1194,7 +1200,58 @@ fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
     )
     .legend_position(None);
     f.render_widget(duty_chart, duty_area);
+    draw_load(f, load_area, &samples, now, span);
     draw_temps(f, temp_area, app, &samples, now, span);
+}
+
+/// A time axis with only its ends labelled, for the narrow charts.
+fn short_axis(span: f64) -> Axis<'static> {
+    Axis::default()
+        .bounds([-span, 0.0])
+        .labels(
+            [format!("-{:.0}m", span / 60.0), "now".into()]
+                .map(|l| Span::styled(l, Style::new().fg(DIM))),
+        )
+        .style(Style::new().fg(DIM))
+}
+
+/// The 1-minute load average, against the number of cores.
+fn draw_load(f: &mut Frame, area: Rect, samples: &[Sample], now: f64, span: f64) {
+    let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as f64;
+    let pts: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|s| s.load.map(|l| (s.t - now, l)))
+        .collect();
+    let cores_line = vec![(-span, cores), (0.0, cores)];
+    let peak = pts.iter().map(|p| p.1).fold(cores, f64::max);
+    let top = (peak * 1.1 / 5.0).ceil() * 5.0;
+    let cores_key = format!("{cores:.0} cores");
+    let block = panel("Load average").title(key_line(&[("1 min", LOAD), (&cores_key, DIM)]));
+    let chart = Chart::new(vec![
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(DIM))
+            .data(&cores_line),
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(LOAD))
+            .data(&pts),
+    ])
+    .block(block)
+    .x_axis(short_axis(span))
+    .y_axis(
+        Axis::default()
+            .bounds([0.0, top])
+            .labels(
+                [0.0, top / 2.0, top]
+                    .map(|v| Span::styled(format!("{v:.0}"), Style::new().fg(DIM))),
+            )
+            .style(Style::new().fg(DIM)),
+    )
+    .legend_position(None);
+    f.render_widget(chart, area);
 }
 
 /// The hottest die reading in each period, and the setpoint the temperature loop held.
