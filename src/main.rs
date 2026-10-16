@@ -86,7 +86,9 @@ fn main() {
         Some("run") => governor::run(config::default_path()),
         None if tty => tui::run(),
         None | Some("status") => load().map(|c| status(&c)),
-        Some("pause") => load().and_then(|c| pause(&c)),
+        Some("pause") => load().and_then(|c| pause(&c)).map(|_| {
+            println!("throttling off; all work continued (guvnor resume to turn it back on)")
+        }),
         Some("resume") => state::set_paused(false)
             .map_err(|e| e.to_string())
             .map(|_| println!("throttling on")),
@@ -277,6 +279,5 @@ fn pause(c: &config::Config) -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    println!("throttling off; all work continued (guvnor resume to turn it back on)");
     Ok(())
 }
