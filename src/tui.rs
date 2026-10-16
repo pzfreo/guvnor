@@ -50,6 +50,8 @@ struct Owner {
     choice: &'static str,
     /// How many of its processes are controlled, by any rule.
     controlled: usize,
+    /// How many processes it runs, busy or not.
+    count: usize,
     /// Whether its processes are listed below it (→ opens, ← closes).
     open: bool,
 }
@@ -568,6 +570,7 @@ fn items(
                 members.iter().any(|&i| work[i].proc.pid == p)
             }
         });
+        let count = members.iter().filter(|&&i| work[i].proc.pid != pid).count();
         let members: Vec<usize> = members
             .into_iter()
             .filter(|&i| {
@@ -605,6 +608,7 @@ fn items(
                 total,
                 choice,
                 controlled,
+                count,
                 open: view.open.contains(&pid),
             },
             members,
@@ -1273,7 +1277,7 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let header = Row::new(
-        ["PID", "STATE", "CPU", "CONTROL", "OWNER / PROCESS"]
+        ["PID", "STATE", "CPU", "CONTROL", "OWNER  └ ITS PROCESSES"]
             .map(|h| Cell::from(h).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD))),
     );
     let cpu_color = |cpu: f64| {
@@ -1302,18 +1306,30 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
                     _ => control,
                 };
                 let on = !o.choice.is_empty();
-                let mark = if o.open { "▾ owner" } else { "▹ owner" };
+                let mark = if o.open { "▾ " } else { "▸ " };
+                let place = if o.place.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · in {}", o.place)
+                };
+                let runs = match o.count {
+                    1 => "  owns 1 process".to_string(),
+                    n => format!("  owns {n} processes"),
+                };
                 Row::new([
                     Cell::from(o.pid.to_string()).style(Style::new().fg(DIM)),
-                    Cell::from(mark).style(Style::new().fg(ACCENT)),
+                    Cell::from("◆ owner").style(Style::new().fg(ACCENT).bold()),
                     Cell::from(format!("{:>5.0}%", o.total))
                         .style(Style::new().fg(cpu_color(o.total)).bold()),
                     Cell::from(control).style(Style::new().fg(if on { ACCENT } else { DIM })),
                     Cell::from(Line::from(vec![
-                        Span::styled(o.name.clone(), Style::new().fg(Color::White).bold()),
-                        Span::styled(format!("  {}", o.place), Style::new().fg(DIM)),
+                        Span::styled(mark, Style::new().fg(ACCENT)),
+                        Span::styled(o.name.clone(), Style::new().fg(ACCENT).bold()),
+                        Span::styled(runs, Style::new().fg(Color::Gray)),
+                        Span::styled(place, Style::new().fg(DIM)),
                     ])),
                 ])
+                .style(Style::new().bg(Color::Rgb(24, 32, 44)))
             }
             Item::Proc { idx, depth } => {
                 let w = &app.work[*idx];
@@ -1340,7 +1356,7 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
                     format!("  {}└ ", "  ".repeat(*depth))
                 };
                 let label = if p.pid == p.owner {
-                    format!("{owner} (itself)")
+                    format!("{owner} itself")
                 } else {
                     p.name.clone()
                 };
@@ -1515,6 +1531,7 @@ mod tests {
             total: 0.0,
             choice: "",
             controlled: 0,
+            count: 0,
             open: false,
         };
         let mut seen = vec![];
