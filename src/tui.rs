@@ -16,7 +16,7 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 use regex::Regex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 const ACCENT: Color = Color::Rgb(94, 196, 255);
@@ -50,9 +50,30 @@ struct Owner {
     choice: &'static str,
     /// How many of its processes are controlled, by any rule.
     controlled: usize,
-    /// Whether its processes are listed below it: only the selected owner's are.
+    /// Whether its processes are listed below it (→ opens, ← closes).
     open: bool,
 }
+
+/// What keeps the table still enough to choose from: lines linger after they go quiet, and
+/// the order holds while you are moving around it.
+#[derive(Default)]
+struct View {
+    /// When each line (pid, owner line) was last busy enough to list.
+    busy_at: HashMap<(i32, bool), Instant>,
+    /// Each line's position last time.
+    order: HashMap<(i32, bool), usize>,
+    /// Keep the last order, putting new lines last.
+    frozen: bool,
+    /// Owners opened with →, to list their processes.
+    open: HashSet<i32>,
+}
+
+/// How long a line stays after it goes quiet.
+const LINGER: Duration = Duration::from_secs(60);
+/// How long after a key press the order holds.
+const HOLD: Duration = Duration::from_secs(15);
+/// The CPU figures are averaged over about this long.
+const SMOOTH: f64 = 10.0;
 
 /// One line of the process table: an owner, or a process under it at some depth.
 enum Item {
@@ -84,6 +105,11 @@ struct App {
     items: Vec<Item>,
     cpu_prev: HashMap<i32, u64>,
     cpu_at: Instant,
+    /// Each process's CPU, smoothed.
+    cpu_avg: HashMap<i32, f64>,
+    view: View,
+    /// The last key press, for holding the order.
+    pressed: Option<Instant>,
     /// Our own rpm samples, for the chart when no governor is running.
     local: VecDeque<Sample>,
     message: Option<(String, Instant)>,
@@ -105,6 +131,9 @@ impl App {
             items: vec![],
             cpu_prev: HashMap::new(),
             cpu_at: Instant::now(),
+            cpu_avg: HashMap::new(),
+            view: View::default(),
+            pressed: None,
             local: VecDeque::new(),
             message: None,
             selected: None,
@@ -169,28 +198,49 @@ impl App {
         let elapsed = self.cpu_at.elapsed().as_nanos().max(1) as f64;
         self.cpu_at = Instant::now();
         let mut prev = std::mem::take(&mut self.cpu_prev);
+        let mut avg = std::mem::take(&mut self.cpu_avg);
+        let a = 1.0 - (-elapsed / 1e9 / SMOOTH).exp();
         let work: Vec<Work> = procs::Matcher::new(&self.config.work)
             .classify()
             .into_iter()
             .map(|proc| {
                 let ns = procs::cpu_ns(proc.pid).unwrap_or(0);
-                let cpu = prev
+                let now = prev
                     .remove(&proc.pid)
                     .map(|old| ns.saturating_sub(old) as f64 / elapsed * 100.0);
                 self.cpu_prev.insert(proc.pid, ns);
-                Work {
-                    proc,
-                    cpu: cpu.unwrap_or(0.0),
-                }
+                // The first reading starts the average; until then there is none.
+                let cpu = match (avg.remove(&proc.pid), now) {
+                    (Some(old), Some(now)) => old + a * (now - old),
+                    (None, Some(now)) => now,
+                    (old, None) => old.unwrap_or(0.0),
+                };
+                self.cpu_avg.insert(proc.pid, cpu);
+                Work { proc, cpu }
             })
             .collect();
-        self.items = items(&work, &self.config.work, self.selected);
         self.work = work;
-        if self
-            .selected
-            .is_some_and(|k| !self.items.iter().any(|i| i.key(&self.work) == k))
+        self.rebuild();
+    }
+
+    /// Lays out the table again, keeping the selection: if a selected process has gone, its
+    /// owner is selected instead.
+    fn rebuild(&mut self) {
+        self.view.frozen = self.pressed.is_some_and(|t| t.elapsed() < HOLD);
+        let owner_of_selected = match self.selected {
+            Some((pid, false)) => self
+                .work
+                .iter()
+                .find(|w| w.proc.pid == pid)
+                .map(|w| w.proc.owner),
+            _ => None,
+        };
+        self.items = items(&self.work, &self.config.work, self.selected, &mut self.view);
+        let present = |k| self.items.iter().any(|i| i.key(&self.work) == k);
+        if let Some(k) = self.selected
+            && !present(k)
         {
-            self.selected = None;
+            self.selected = owner_of_selected.map(|o| (o, true)).filter(|&k| present(k));
         }
     }
 
@@ -233,8 +283,25 @@ impl App {
             None => 0,
         };
         self.selected = Some(self.items[i].key(&self.work));
-        // Open the owner just moved onto at once.
-        self.items = items(&self.work, &self.config.work, self.selected);
+    }
+
+    /// → opens the selected owner; ← closes it, or the owner of the selected process.
+    fn open(&mut self, open: bool) {
+        let owner = match self.selected {
+            Some((pid, true)) => pid,
+            Some((pid, false)) => match self.work.iter().find(|w| w.proc.pid == pid) {
+                Some(w) => w.proc.owner,
+                None => return,
+            },
+            None => return,
+        };
+        if open {
+            self.view.open.insert(owner);
+        } else {
+            self.view.open.remove(&owner);
+            self.selected = Some((owner, true));
+        }
+        self.rebuild();
     }
 
     /// Enter: the selected owner or process moves to its next control state.
@@ -445,10 +512,23 @@ fn apply(
 }
 
 /// Groups the processes by owner, one line each. An owner is listed when its work is busy (5%
-/// or more), when any of it is controlled, or when it is chosen. Under the selected owner (the
-/// busiest when nothing is selected) go its processes that are busy (1% or more) or
-/// controlled, as a tree with the idle ones between them left out.
-fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> Vec<Item> {
+/// or more), when any of it is controlled, or when it is chosen. Under an opened owner go its
+/// processes that are busy (1% or more) or controlled, as a tree with the idle ones between
+/// them left out.
+fn items(
+    work: &[Work],
+    rules: &config::Work,
+    selected: Option<(i32, bool)>,
+    view: &mut View,
+) -> Vec<Item> {
+    let now = Instant::now();
+    view.busy_at.retain(|_, t| now.duration_since(*t) < LINGER);
+    let mut lingers = |key: (i32, bool), busy: bool| {
+        if busy {
+            view.busy_at.insert(key, now);
+        }
+        view.busy_at.contains_key(&key)
+    };
     let pins = state::read_pins();
     let owner_rule = (!rules.owners.is_empty())
         .then(|| Regex::new(&format!("^(?:{})$", rules.owners.join("|"))).ok())
@@ -488,11 +568,16 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
                 members.iter().any(|&i| work[i].proc.pid == p)
             }
         });
-        let shown = |i: usize| {
-            let w = &work[i];
-            w.cpu >= 1.0 || w.proc.controlled() || selected == Some((w.proc.pid, false))
-        };
-        if !(total >= 5.0
+        let members: Vec<usize> = members
+            .into_iter()
+            .filter(|&i| {
+                let w = &work[i];
+                lingers((w.proc.pid, false), w.cpu >= 1.0)
+                    || w.proc.controlled()
+                    || selected == Some((w.proc.pid, false))
+            })
+            .collect();
+        if !(lingers((pid, true), total >= 5.0)
             || !choice.is_empty()
             || members.iter().any(|&i| work[i].proc.controlled())
             || has_selected)
@@ -511,7 +596,6 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
             .iter()
             .filter(|&&i| work[i].proc.controlled())
             .count();
-        let members: Vec<usize> = members.into_iter().filter(|&i| shown(i)).collect();
         owners.push((
             Owner {
                 pid,
@@ -521,17 +605,25 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
                 total,
                 choice,
                 controlled,
-                open: has_selected,
+                open: view.open.contains(&pid),
             },
             members,
         ));
     }
-    owners.sort_by(|a, b| b.0.total.total_cmp(&a.0.total).then(a.0.pid.cmp(&b.0.pid)));
-    if !owners.iter().any(|o| o.0.open)
-        && let Some(first) = owners.first_mut()
-    {
-        first.0.open = true;
-    }
+    // Busiest first; while frozen, the order last shown with new lines last.
+    let rank = |key: (i32, bool)| {
+        if view.frozen {
+            view.order.get(&key).copied().unwrap_or(usize::MAX)
+        } else {
+            0
+        }
+    };
+    owners.sort_by(|a, b| {
+        rank((a.0.pid, true))
+            .cmp(&rank((b.0.pid, true)))
+            .then(b.0.total.total_cmp(&a.0.total))
+            .then(a.0.pid.cmp(&b.0.pid))
+    });
 
     let mut out = vec![];
     for (owner, members) in owners {
@@ -573,9 +665,12 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
         let mut stack: Vec<(usize, usize)> = vec![];
         let push = |stack: &mut Vec<(usize, usize)>, parent: i32, depth: usize| {
             let mut list = kids.get(&parent).cloned().unwrap_or_default();
+            // Popped from the end: the busiest (or first, while frozen) goes last.
             list.sort_by(|&a, &b| {
                 let s = |i: usize| sub.get(&work[i].proc.pid).copied().unwrap_or(0.0);
-                s(a).total_cmp(&s(b))
+                let r = |i: usize| rank((work[i].proc.pid, false));
+                r(b).cmp(&r(a))
+                    .then(s(a).total_cmp(&s(b)))
                     .then(work[b].proc.pid.cmp(&work[a].proc.pid))
             });
             stack.extend(list.into_iter().map(|i| (i, depth)));
@@ -590,6 +685,11 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
             }
         }
     }
+    view.order = out
+        .iter()
+        .enumerate()
+        .map(|(n, i)| (i.key(work), n))
+        .collect();
     out
 }
 
@@ -669,10 +769,14 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<(), String> {
                 KeyCode::Char('-') => app.nudge_target(-100),
                 KeyCode::Up | KeyCode::Char('k') => app.select(-1),
                 KeyCode::Down | KeyCode::Char('j') => app.select(1),
+                KeyCode::Right | KeyCode::Char('l') => app.open(true),
+                KeyCode::Left | KeyCode::Char('h') => app.open(false),
                 KeyCode::Enter => app.cycle(),
                 _ => {}
             }
-            // Show the effect of a key at once.
+            // Hold the order while choosing, and show the effect of a key at once.
+            app.pressed = Some(Instant::now());
+            app.rebuild();
             app.refresh_fast();
             fast = Instant::now();
         }
@@ -1337,6 +1441,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         key("↑↓"),
         Span::raw(" select  "),
+        key("→←"),
+        Span::raw(" open  "),
         key("⏎"),
         Span::raw(" control: off → this → all  "),
         key("p"),

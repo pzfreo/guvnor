@@ -43,13 +43,14 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
   what you started: a Claude Code session or a command in a terminal tab (the first process below
   the terminal, login, ssh, tmux and their shell), or an app for its helpers. It shows with its
   current directory, so sessions in different repos are told apart. Under it, as a tree, its
-  processes, for the selected owner only: those using 1% CPU or more or controlled (running or paused, and what controls them);
+  processes, for owners you open with `→`: those using 1% CPU or more or controlled (running or paused, and what controls them). CPU is averaged over about 10 s, quiet lines stay a minute, and the order holds for 15 s after each key press, so lines do not move while you choose;
   owners using under 5% with nothing controlled are left out;
 - the governor's recent events, coloured.
 
 Keys:
 
-- `↑` / `↓` (or `j` / `k`) select an owner or a process. `Enter` on an owner cycles it through
+- `↑` / `↓` (or `j` / `k`) select an owner or a process; `→` / `←` (or `l` / `h`) open and close an
+  owner. `Enter` on an owner cycles it through
   **off → its work → all like it**:
   - **its work**: control everything this owner runs, but not the owner itself (often what you
     interact with). Remembered by pid and start time until it exits.
