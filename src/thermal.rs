@@ -132,7 +132,9 @@ impl Thermal {
             // Fans off, or well below the target and the setpoint well under the one that last
             // overshot: plenty of room, so rise at the fast rate.
             let off = rpm < r.off_below;
-            let near = self.over.is_some_and(|o| self.setpoint + 2.0 * self.t.step >= o);
+            let near = self
+                .over
+                .is_some_and(|o| self.setpoint + 2.0 * self.t.step >= o);
             let below = !off && rpm + r.high_above < target && !near;
             reason = if off {
                 Reason::Off
@@ -383,7 +385,11 @@ mod tests {
         for _ in 0..11 {
             c.outer(3600, 4000);
         }
-        assert_eq!(c.setpoint(), 93.0, "base_every × slow (12 periods) per step");
+        assert_eq!(
+            c.setpoint(),
+            93.0,
+            "base_every × slow (12 periods) per step"
+        );
         c.outer(3600, 4000);
         assert_eq!(c.setpoint(), 94.0);
         // Fans off: the load has gone, so the fast rate again.

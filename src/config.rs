@@ -100,6 +100,8 @@ pub struct Rules {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Work {
+    /// Regexes on the whole name of an owner (see `procs::owners`): all its work is controlled.
+    pub owners: Vec<String>,
     /// Regexes matched against the whole process name (like `pgrep -x`).
     pub names: Vec<String>,
     /// Regexes searched for in the executable's path, as it was run.
@@ -165,6 +167,7 @@ impl Default for Rules {
 impl Default for Work {
     fn default() -> Self {
         Work {
+            owners: vec![],
             names: vec![],
             exes: vec![],
             cmdlines: vec![],
@@ -258,8 +261,9 @@ impl Config {
         }
         let w = &self.work;
         for p in w
-            .names
+            .owners
             .iter()
+            .chain(&w.names)
             .chain(&w.exes)
             .chain(&w.cmdlines)
             .chain(&w.tree_names)
@@ -313,8 +317,14 @@ relearn_every = 30    # rises stop just below the duty that last overshot; after
 
 [work]
 # Which processes guvnor throttles. Nothing until you choose: in the dashboard (`guvnor`),
-# select a busy process and press Enter to cycle it through off -> just this process -> all
-# like it, which edits names and exclude_names here. Or write rules; each is a regex.
+# select an owner (what you started: a Claude Code session, a command in a terminal tab, an
+# app) or one process, and press Enter to cycle it through off -> just this one -> all like
+# it. Choosing all like it edits owners, names and exclude_names here. Or write rules; each
+# is a regex.
+#
+# Owners by whole name: everything they start is work, but not the owner itself. For example
+# ["claude"] throttles what every Claude Code session runs, not the session.
+owners = []
 #
 # The whole process name (like pgrep -x). For example:
 #   Rust:   ["rustc", "cargo", "ld", "cc"]      C/C++:  ["clang", "cc1plus", "ld", "make"]

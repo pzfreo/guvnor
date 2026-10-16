@@ -121,12 +121,16 @@ pub fn read_status() -> Option<Status> {
     serde_json::from_slice(&fs::read(dir().join("status.json")).ok()?).ok()
 }
 
-/// Per-process choices made in the dashboard: (pid, start time) of processes to control or to
-/// leave alone, whatever the config's rules say. They lapse when the process exits.
+/// Choices made in the dashboard: (pid, start time) of processes to control or to leave alone,
+/// whatever the config's rules say, and of owners whose work to control. They lapse when the
+/// process exits.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Pins {
     pub on: Vec<(i32, u64)>,
     pub off: Vec<(i32, u64)>,
+    /// Owners whose work is controlled (see `procs::owners`).
+    pub owners: Vec<(i32, u64)>,
 }
 
 pub fn read_pins() -> Pins {
@@ -143,6 +147,7 @@ pub fn write_pins(pins: &Pins) -> std::io::Result<()> {
     let pins = Pins {
         on: pins.on.iter().copied().filter(live).collect(),
         off: pins.off.iter().copied().filter(live).collect(),
+        owners: pins.owners.iter().copied().filter(live).collect(),
     };
     write_atomic("pins.json", &serde_json::to_vec(&pins).unwrap())
 }

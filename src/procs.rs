@@ -14,7 +14,9 @@ pub struct Proc {
     zombie: bool,
     /// Start time in microseconds: with the pid, it names one process even after the pid is reused.
     pub start: u64,
-    /// Why it counts as work: "name", "exe", "cmdline", "tree" or "pid" (chosen in the
+    /// The process that started this work: see `owners`. Set by `classify`, else 0.
+    pub owner: i32,
+    /// Why it counts as work: "owner", "name", "exe", "cmdline", "tree" or "pid" (chosen in the
     /// dashboard). Not work: "excluded" (exclude_names), "released" (chosen in the dashboard),
     /// or "" (no rule matches).
     pub reason: &'static str,
@@ -58,6 +60,7 @@ pub fn info(pid: i32) -> Option<Proc> {
         stopped: bi.pbi_status == libc::SSTOP,
         zombie: bi.pbi_status == 5, // SZOMB
         start: bi.pbi_start_tvsec * 1_000_000 + bi.pbi_start_tvusec,
+        owner: 0,
         reason: "",
     })
 }
@@ -85,6 +88,10 @@ pub fn all() -> Vec<Proc> {
 /// The executable path as it was run, and the command line (arguments joined by spaces, as
 /// `pgrep -f` sees it).
 pub fn args(pid: i32) -> Option<(String, String)> {
+    argv(pid).map(|(exe, args)| (exe, args.join(" ")))
+}
+
+fn argv(pid: i32) -> Option<(String, Vec<String>)> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut buf = vec![0u8; 256 * 1024];
     let mut size = buf.len();
@@ -114,7 +121,86 @@ pub fn args(pid: i32) -> Option<(String, String)> {
         .take(argc)
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
-    Some((exe, args.join(" ")))
+    Some((exe, args))
+}
+
+/// The current directory of a process, if we may see it.
+pub fn cwd(pid: i32) -> Option<String> {
+    let mut vi: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_vnodepathinfo>() as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut vi as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    // libc declares the MAXPATHLEN buffer as 32 × 32 bytes.
+    let path = vi.pvi_cdir.vip_path.as_flattened();
+    (n == size).then(|| c_str(path)).filter(|s| !s.is_empty())
+}
+
+/// What hosts sessions rather than doing work: terminals' login, ssh and multiplexers.
+fn is_host(name: &str) -> bool {
+    matches!(
+        name,
+        "login" | "sshd" | "sshd-session" | "tmux" | "screen" | "mosh-server" | "zellij"
+    )
+}
+
+fn is_shell(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('-'),
+        "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh" | "tcsh" | "csh" | "nu"
+    )
+}
+
+/// The owner of each process: what you started that led to it. Walking down from launchd, it
+/// is the first process that is not a terminal app, login, ssh, a multiplexer or the shell
+/// they run. So a Claude Code session in a terminal tab owns everything its tools run, a
+/// command typed into a tab owns its children, and an app owns its helpers.
+pub fn owners(procs: &[Proc]) -> HashMap<i32, i32> {
+    let by_pid: HashMap<i32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
+    let mut out = HashMap::new();
+    for p in procs {
+        let mut path = vec![p];
+        let mut seen = HashSet::from([p.pid]);
+        while let Some(&q) = by_pid.get(&path.last().unwrap().ppid) {
+            if q.pid <= 1 || !seen.insert(q.pid) {
+                break;
+            }
+            path.push(q);
+        }
+        path.reverse();
+        let mut owner = p.pid;
+        // A parent we cannot see is root's: a terminal's login, or sshd.
+        let top = path[0];
+        let mut after_host = top.ppid > 1 && !by_pid.contains_key(&top.ppid);
+        for (i, q) in path.iter().enumerate() {
+            let next_is_login = path.get(i + 1).is_some_and(|n| n.name == "login");
+            if is_host(&q.name) || next_is_login {
+                after_host = true;
+            } else if !(after_host && is_shell(&q.name)) {
+                owner = q.pid;
+                break;
+            }
+        }
+        out.insert(p.pid, owner);
+    }
+    out
+}
+
+/// An owner's name for rules and the dashboard: its executable's file name as it was run.
+/// Not the registered name: Claude Code registers its version (2.1.301) there.
+pub fn owner_name(p: &Proc, args: &impl Fn(i32) -> Option<(String, String)>) -> String {
+    args(p.pid)
+        .and_then(|(exe, _)| {
+            let base = exe.rsplit('/').next()?;
+            (!base.is_empty()).then(|| base.to_string())
+        })
+        .unwrap_or_else(|| p.name.clone())
 }
 
 fn any_of(patterns: &[String], whole: bool) -> Option<Regex> {
@@ -127,6 +213,7 @@ fn any_of(patterns: &[String], whole: bool) -> Option<Regex> {
 }
 
 pub struct Matcher {
+    owners: Option<Regex>,
     names: Option<Regex>,
     exes: Option<Regex>,
     cmdlines: Option<Regex>,
@@ -145,6 +232,7 @@ impl Proc {
 impl Matcher {
     pub fn new(w: &Work) -> Matcher {
         Matcher {
+            owners: any_of(&w.owners, true),
             names: any_of(&w.names, true),
             exes: any_of(&w.exes, false),
             cmdlines: any_of(&w.cmdlines, false),
@@ -200,6 +288,31 @@ impl Matcher {
         pins: &crate::state::Pins,
     ) -> Vec<Proc> {
         let by_pid: HashMap<i32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
+        let owner_of = owners(&procs);
+        let mut owner_names: HashMap<i32, String> = HashMap::new();
+        if self.owners.is_some() {
+            for &o in owner_of.values() {
+                owner_names.entry(o).or_insert_with(|| {
+                    by_pid
+                        .get(&o)
+                        .map(|op| owner_name(op, &args))
+                        .unwrap_or_default()
+                });
+            }
+        }
+        // Work started by a chosen owner: everything under it, not the owner itself (often
+        // what you interact with, like a Claude Code session).
+        let chosen_owner = |p: &Proc| {
+            let o = owner_of.get(&p.pid).copied().unwrap_or(p.pid);
+            o != p.pid
+                && by_pid.get(&o).is_some_and(|op| {
+                    pins.owners.contains(&(op.pid, op.start))
+                        || self
+                            .owners
+                            .as_ref()
+                            .is_some_and(|r| owner_names.get(&o).is_some_and(|n| r.is_match(n)))
+                })
+        };
         let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
         for p in &procs {
             children.entry(p.ppid).or_default().push(p.pid);
@@ -251,7 +364,9 @@ impl Matcher {
                 Default::default()
             };
             let is = |r: &Option<Regex>, s: &str| r.as_ref().is_some_and(|r| r.is_match(s));
-            let reason = if is(&self.names, &p.name) {
+            let reason = if chosen_owner(p) {
+                Some("owner")
+            } else if is(&self.names, &p.name) {
                 Some("name")
             } else if is(&self.exes, &exe) {
                 Some("exe")
@@ -284,6 +399,7 @@ impl Matcher {
                 };
                 Proc {
                     reason,
+                    owner: owner_of.get(&p.pid).copied().unwrap_or(p.pid),
                     ..p.clone()
                 }
             })
@@ -352,6 +468,7 @@ mod tests {
             stopped: false,
             zombie: false,
             start: pid as u64 * 7,
+            owner: 0,
             reason: "",
         }
     }
@@ -449,6 +566,7 @@ mod tests {
         let pins = crate::state::Pins {
             on: vec![(20, 140), (11, 1)], // zsh's entry has the wrong start time: a reused pid
             off: vec![(21, 147)],
+            ..Default::default()
         };
         let w = Work {
             names: vec!["rustc".into()],
@@ -479,11 +597,87 @@ mod tests {
     }
 
     #[test]
+    fn owners_are_what_you_started_in_a_tab_or_the_app() {
+        let procs = vec![
+            p(1, 0, 0, "launchd"),
+            p(10, 1, 501, "ghostty"),
+            p(11, 10, 0, "login"),
+            p(12, 11, 501, "zsh"),
+            p(13, 12, 501, "claude"), // a session in a tab
+            p(14, 13, 501, "zsh"),    // its tool's shell
+            p(15, 14, 501, "cargo"),
+            p(16, 15, 501, "sheets-0123456789abcdef"),
+            p(20, 11, 501, "zsh"), // another tab
+            p(21, 20, 501, "cargo"),
+            p(22, 21, 501, "rustc"),
+            p(30, 1, 501, "tmux"),
+            p(31, 30, 501, "bash"),
+            p(32, 31, 501, "python3.14"),
+            p(40, 1, 501, "Google Chrome"),
+            p(41, 40, 501, "Google Chrome Helper"),
+            p(50, 1, 501, "codex"),
+        ];
+        let o = owners(&procs);
+        let of = |pid| o[&pid];
+        assert_eq!([of(13), of(14), of(15), of(16)], [13; 4]);
+        assert_eq!([of(21), of(22)], [21, 21]);
+        assert_eq!(of(32), 32);
+        assert_eq!([of(40), of(41)], [40, 40]);
+        assert_eq!(of(50), 50);
+        assert_eq!(of(12), 12); // a tab's idle shell owns itself
+    }
+
+    #[test]
+    fn a_chosen_owner_controls_its_work_but_not_itself() {
+        let procs = vec![
+            p(1, 0, 0, "launchd"),
+            p(10, 1, 501, "ghostty"),
+            p(11, 10, 0, "login"),
+            p(12, 11, 501, "zsh"),
+            p(13, 12, 501, "claude"),
+            p(14, 13, 501, "zsh"),
+            p(15, 14, 501, "node"),
+            p(16, 15, 501, "rustc"),
+            p(20, 11, 501, "zsh"),
+            p(21, 20, 501, "claude"), // another session
+            p(22, 21, 501, "python3"),
+        ];
+        let classify = |w: &Work, pins: &crate::state::Pins| -> Vec<(i32, &'static str)> {
+            Matcher::new(w)
+                .classify_in(procs.clone(), 999, 501, |_| None, pins)
+                .iter()
+                .filter(|p| p.controlled())
+                .map(|p| (p.pid, p.reason))
+                .collect()
+        };
+        let pins = crate::state::Pins {
+            owners: vec![(13, 91)],
+            off: vec![(16, 112)], // one process released wins over its owner
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&Work::default(), &pins),
+            vec![(14, "owner"), (15, "owner")]
+        );
+        // By name: every claude session.
+        let w = Work {
+            owners: vec!["claude".into()],
+            ..Work::default()
+        };
+        let all = classify(&w, &Default::default());
+        assert_eq!(
+            all,
+            vec![(14, "owner"), (15, "owner"), (16, "owner"), (22, "owner")]
+        );
+    }
+
+    #[test]
     fn reads_this_process() {
         let me = info(std::process::id() as i32).unwrap();
         assert!(!me.stopped);
         let (exe, line) = args(me.pid).unwrap();
         assert!(exe.contains("guvnor") && line.contains("guvnor"));
         assert!(cpu_ns(me.pid).unwrap() > 0);
+        assert!(cwd(me.pid).is_some());
     }
 }

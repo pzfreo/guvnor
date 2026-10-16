@@ -39,13 +39,24 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
   paused, with a countdown;
 - the fan speed, the duty and the die temperature (hottest reading each period, with the
   setpoint) over the last hour, starting at 5 minutes and widening as history builds;
-- your processes: those guvnor controls (running or paused, and what controls them), then any
-  others using 5% CPU or more (`○ free`), then any you excluded;
+- your work grouped by **owner**, busiest owner first, with each owner's total CPU. An owner is
+  what you started: a Claude Code session or a command in a terminal tab (the first process below
+  the terminal, login, ssh, tmux and their shell), or an app for its helpers. It shows with its
+  current directory, so sessions in different repos are told apart. Under it, as a tree, its
+  processes using 1% CPU or more or controlled (running or paused, and what controls them);
+  owners using under 5% with nothing controlled are left out;
 - the governor's recent events, coloured.
 
 Keys:
 
-- `↑` / `↓` (or `j` / `k`) select a process, and `Enter` cycles it through **off → this → all**:
+- `↑` / `↓` (or `j` / `k`) select an owner or a process. `Enter` on an owner cycles it through
+  **off → its work → all like it**:
+  - **its work**: control everything this owner runs, but not the owner itself (often what you
+    interact with). Remembered by pid and start time until it exits.
+  - **all like it**: every owner with this name, through `[work] owners` (`claude` covers every
+    Claude Code session's work).
+  - **off**: neither; rules by name still apply.
+- `Enter` on a process cycles it through **off → this → all**:
   - **this**: control just this process, until it exits. Remembered by pid and start time in the
     state directory, so a reused pid is not mistaken for it; the config is not touched.
   - **all**: control every process like it, through a rule in `[work] names`. Versions and cargo's
@@ -85,7 +96,8 @@ an error. `guvnor config` prints them all with comments. In short:
   duty × 0.9; fans off (below 2000) +10 points every 3 periods; at base speed +5 points every 6;
   `floor` 0.2, `ceiling` 1.0; `cut_hold` and `relearn_every` (below).
 - `[work]`: which processes are throttled. **Empty by default: nothing is controlled until you
-  choose**, in the dashboard or here. `names` (whole process name, like `pgrep -x`), `exes` (search
+  choose**, in the dashboard or here. `owners` (whole name of an owner's executable: everything
+  under it), `names` (whole process name, like `pgrep -x`), `exes` (search
   in the executable's path, e.g. `/(release|debug)/` for anything cargo builds), `cmdlines`
   (search in the whole command line, like `pgrep -f`), `tree_names` / `tree_cmdlines` (that process
   and all its descendants), and `exclude_names` (never, whatever else matches). `guvnor config`

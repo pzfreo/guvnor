@@ -37,6 +37,35 @@ struct Work {
     cpu: f64,
 }
 
+/// What started some work: see `procs::owners`.
+struct Owner {
+    pid: i32,
+    start: u64,
+    name: String,
+    /// Its current directory, with the home directory as ~.
+    place: String,
+    /// CPU of the owner and everything under it.
+    total: f64,
+    /// "this" (chosen in the dashboard), "all" (a config rule on its name) or "".
+    choice: &'static str,
+}
+
+/// One line of the process table: an owner, or a process under it at some depth.
+enum Item {
+    Owner(Owner),
+    Proc { idx: usize, depth: usize },
+}
+
+impl Item {
+    /// The selection key: the pid, and whether it is the owner's line.
+    fn key(&self, work: &[Work]) -> (i32, bool) {
+        match self {
+            Item::Owner(o) => (o.pid, true),
+            Item::Proc { idx, .. } => (work[*idx].proc.pid, false),
+        }
+    }
+}
+
 struct App {
     smc: Option<Smc>,
     config: Config,
@@ -45,14 +74,17 @@ struct App {
     spin: Vec<f64>,
     power: Power,
     status: Option<Status>,
+    /// Every process guvnor could control, with its CPU.
     work: Vec<Work>,
+    /// The table: busy owners, busiest first, each with its busy or controlled processes.
+    items: Vec<Item>,
     cpu_prev: HashMap<i32, u64>,
     cpu_at: Instant,
     /// Our own rpm samples, for the chart when no governor is running.
     local: VecDeque<Sample>,
     message: Option<(String, Instant)>,
-    /// The selected process, kept by pid across refreshes.
-    selected: Option<i32>,
+    /// The selected line, kept by (pid, owner line) across refreshes.
+    selected: Option<(i32, bool)>,
 }
 
 impl App {
@@ -66,6 +98,7 @@ impl App {
             power: Power::default(),
             status: None,
             work: vec![],
+            items: vec![],
             cpu_prev: HashMap::new(),
             cpu_at: Instant::now(),
             local: VecDeque::new(),
@@ -132,7 +165,7 @@ impl App {
         let elapsed = self.cpu_at.elapsed().as_nanos().max(1) as f64;
         self.cpu_at = Instant::now();
         let mut prev = std::mem::take(&mut self.cpu_prev);
-        let mut work: Vec<Work> = procs::Matcher::new(&self.config.work)
+        let work: Vec<Work> = procs::Matcher::new(&self.config.work)
             .classify()
             .into_iter()
             .map(|proc| {
@@ -147,25 +180,11 @@ impl App {
                 }
             })
             .collect();
-        // Controlled processes first, then busy ones guvnor ignores (candidates), then the ones
-        // left alone on purpose; busiest first within each.
-        let group = |w: &Work| match w.proc.reason {
-            "excluded" | "released" => 2,
-            "" => 1,
-            _ => 0,
-        };
-        let sel = self.selected;
-        work.retain(|w| !w.proc.reason.is_empty() || w.cpu >= 5.0 || Some(w.proc.pid) == sel);
-        work.sort_by(|a, b| {
-            group(a)
-                .cmp(&group(b))
-                .then(b.cpu.total_cmp(&a.cpu))
-                .then(a.proc.pid.cmp(&b.proc.pid))
-        });
+        self.items = items(&work, &self.config.work, self.selected);
         self.work = work;
         if self
             .selected
-            .is_some_and(|pid| !self.work.iter().any(|w| w.proc.pid == pid))
+            .is_some_and(|k| !self.items.iter().any(|i| i.key(&self.work) == k))
         {
             self.selected = None;
         }
@@ -196,36 +215,37 @@ impl App {
         }
     }
 
-    fn select(&mut self, delta: i32) {
-        if self.work.is_empty() {
-            return;
-        }
-        let i = self
-            .selected
-            .and_then(|pid| self.work.iter().position(|w| w.proc.pid == pid));
-        let i = match i {
-            Some(i) => (i as i32 + delta).clamp(0, self.work.len() as i32 - 1) as usize,
-            None => 0,
-        };
-        self.selected = Some(self.work[i].proc.pid);
+    fn selected_index(&self) -> Option<usize> {
+        let k = self.selected?;
+        self.items.iter().position(|i| i.key(&self.work) == k)
     }
 
-    /// Enter: the selected process moves to its next control state.
+    fn select(&mut self, delta: i32) {
+        if self.items.is_empty() {
+            return;
+        }
+        let i = match self.selected_index() {
+            Some(i) => (i as i32 + delta).clamp(0, self.items.len() as i32 - 1) as usize,
+            None => 0,
+        };
+        self.selected = Some(self.items[i].key(&self.work));
+    }
+
+    /// Enter: the selected owner or process moves to its next control state.
     fn cycle(&mut self) {
-        let Some(w) = self
-            .selected
-            .and_then(|pid| self.work.iter().find(|w| w.proc.pid == pid))
-        else {
-            self.say("select a process first (↑/↓)".into());
+        let Some(i) = self.selected_index() else {
+            self.say("select an owner or a process first (↑/↓)".into());
             return;
         };
-        let proc = w.proc.clone();
-        match apply(
-            next_choice(&proc),
-            &proc,
-            &config::default_path(),
-            &self.config,
-        ) {
+        let path = config::default_path();
+        let result = match &self.items[i] {
+            Item::Owner(o) => apply_owner(o, &path, &self.config),
+            Item::Proc { idx, .. } => {
+                let proc = self.work[*idx].proc.clone();
+                apply(next_choice(&proc), &proc, &path, &self.config)
+            }
+        };
+        match result {
             Ok(m) => self.say(m),
             Err(e) => self.say(format!("error: {e}")),
         }
@@ -418,6 +438,187 @@ fn apply(
     Ok(msg)
 }
 
+/// Groups the processes by owner. An owner is listed when its work is busy (5% or more), when
+/// any of it is controlled, or when it is chosen; under it go its processes that are busy (1%
+/// or more) or controlled, as a tree with the idle ones between them left out.
+fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> Vec<Item> {
+    let pins = state::read_pins();
+    let owner_rule = (!rules.owners.is_empty())
+        .then(|| Regex::new(&format!("^(?:{})$", rules.owners.join("|"))).ok())
+        .flatten();
+    let idx: HashMap<i32, usize> = work
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.proc.pid, i))
+        .collect();
+    let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
+    for (i, w) in work.iter().enumerate() {
+        groups.entry(w.proc.owner).or_default().push(i);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut owners: Vec<(Owner, Vec<usize>)> = vec![];
+    for (pid, members) in groups {
+        let total: f64 = members.iter().map(|&i| work[i].cpu.max(0.0)).sum();
+        let Some(info) = idx
+            .get(&pid)
+            .map(|&i| work[i].proc.clone())
+            .or_else(|| procs::info(pid))
+        else {
+            continue;
+        };
+        let name = procs::owner_name(&info, &procs::args);
+        let choice = if pins.owners.contains(&(pid, info.start)) {
+            "this"
+        } else if owner_rule.as_ref().is_some_and(|r| r.is_match(&name)) {
+            "all"
+        } else {
+            ""
+        };
+        let has_selected = selected.is_some_and(|(p, owner_line)| {
+            if owner_line {
+                p == pid
+            } else {
+                members.iter().any(|&i| work[i].proc.pid == p)
+            }
+        });
+        let shown = |i: usize| {
+            let w = &work[i];
+            w.cpu >= 1.0 || w.proc.controlled() || selected == Some((w.proc.pid, false))
+        };
+        if !(total >= 5.0
+            || !choice.is_empty()
+            || members.iter().any(|&i| work[i].proc.controlled())
+            || has_selected)
+        {
+            continue;
+        }
+        let place = procs::cwd(pid)
+            .map(|c| match c.strip_prefix(&home) {
+                Some(rest) if !home.is_empty() => format!("~{rest}"),
+                _ => c,
+            })
+            .unwrap_or_default();
+        let members: Vec<usize> = members.into_iter().filter(|&i| shown(i)).collect();
+        owners.push((
+            Owner {
+                pid,
+                start: info.start,
+                name,
+                place,
+                total,
+                choice,
+            },
+            members,
+        ));
+    }
+    owners.sort_by(|a, b| b.0.total.total_cmp(&a.0.total).then(a.0.pid.cmp(&b.0.pid)));
+
+    let mut out = vec![];
+    for (owner, members) in owners {
+        // Each shown process hangs from its nearest shown ancestor, or from the owner.
+        let shown: HashMap<i32, usize> = members.iter().map(|&i| (work[i].proc.pid, i)).collect();
+        let parent = |i: usize| -> i32 {
+            let mut p = work[i].proc.ppid;
+            let mut hops = 0;
+            while hops < 64 && p != owner.pid && !shown.contains_key(&p) {
+                match idx.get(&p) {
+                    Some(&j) => p = work[j].proc.ppid,
+                    None => return owner.pid,
+                }
+                hops += 1;
+            }
+            if shown.contains_key(&p) { p } else { owner.pid }
+        };
+        let mut kids: HashMap<i32, Vec<usize>> = HashMap::new();
+        let mut sub: HashMap<i32, f64> = HashMap::new();
+        for &i in &members {
+            let pid = work[i].proc.pid;
+            // The owner itself is listed first among its own work.
+            let up = if pid == owner.pid { 0 } else { parent(i) };
+            kids.entry(up).or_default().push(i);
+            let mut p = pid;
+            let mut hops = 0;
+            while p != owner.pid && p != 0 && hops < 64 {
+                *sub.entry(p).or_default() += work[i].cpu.max(0.0);
+                p = shown.get(&p).map(|&j| parent(j)).unwrap_or(owner.pid);
+                hops += 1;
+            }
+        }
+        let owner_pid = owner.pid;
+        out.push(Item::Owner(owner));
+        let mut stack: Vec<(usize, usize)> = vec![];
+        let push = |stack: &mut Vec<(usize, usize)>, parent: i32, depth: usize| {
+            let mut list = kids.get(&parent).cloned().unwrap_or_default();
+            list.sort_by(|&a, &b| {
+                let s = |i: usize| sub.get(&work[i].proc.pid).copied().unwrap_or(0.0);
+                s(a).total_cmp(&s(b))
+                    .then(work[b].proc.pid.cmp(&work[a].proc.pid))
+            });
+            stack.extend(list.into_iter().map(|i| (i, depth)));
+        };
+        push(&mut stack, owner_pid, 0);
+        push(&mut stack, 0, 0);
+        while let Some((i, depth)) = stack.pop() {
+            out.push(Item::Proc { idx: i, depth });
+            let pid = work[i].proc.pid;
+            if pid != owner_pid {
+                push(&mut stack, pid, depth + 1);
+            }
+        }
+    }
+    out
+}
+
+/// Enter on an owner: not controlled → its work in this session → the work of every owner
+/// with its name → not controlled.
+fn apply_owner(o: &Owner, path: &std::path::Path, current: &Config) -> Result<String, String> {
+    let me = (o.pid, o.start);
+    let mut pins = state::read_pins();
+    let (rule, kind) = family_rule(&o.name);
+    let mut owners = current.work.owners.clone();
+    let named = |r: &String| *r == rule || *r == regex::escape(&o.name);
+    let msg = match o.choice {
+        "" => {
+            pins.owners.push(me);
+            state::write_pins(&pins).map_err(|e| e.to_string())?;
+            return Ok(format!(
+                "work under {} (pid {}): controlled, this one only",
+                o.name, o.pid
+            ));
+        }
+        "this" => {
+            pins.owners.retain(|x| *x != me);
+            if !owners.iter().any(named) {
+                owners.push(rule.clone());
+            }
+            format!("work under every {kind}: controlled")
+        }
+        _ => {
+            pins.owners.retain(|x| *x != me);
+            owners.retain(|r| !named(r));
+            let left = Regex::new(&format!("^(?:{})$", owners.join("|")))
+                .is_ok_and(|r| !owners.is_empty() && r.is_match(&o.name));
+            if left {
+                return Err(format!(
+                    "{} matches another pattern in [work] owners; edit the config",
+                    o.name
+                ));
+            }
+            format!("work under {kind}: not controlled (rules by name still apply)")
+        }
+    };
+    state::write_pins(&pins).map_err(|e| e.to_string())?;
+    edit_config(path, |doc| {
+        if !doc.contains_table("work") {
+            doc["work"] = toml_edit::table();
+        }
+        let v = toml_edit::Value::Array(owners.iter().map(String::as_str).collect());
+        set_value(&mut doc["work"]["owners"], v);
+        Ok(())
+    })?;
+    Ok(msg)
+}
+
 pub fn run() -> Result<(), String> {
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal);
@@ -504,7 +705,7 @@ fn draw(f: &mut Frame, app: &App) {
         Constraint::Length(1),
         Constraint::Length(2 + 2 * app.fans.len().max(2) as u16),
         Constraint::Min(10),
-        Constraint::Length(14),
+        Constraint::Length(16),
         Constraint::Length(1),
     ])
     .areas(f.area());
@@ -515,7 +716,7 @@ fn draw(f: &mut Frame, app: &App) {
     draw_duty(f, duty, app);
     draw_charts(f, charts, app);
     let [work, events] =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(bottom);
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(bottom);
     draw_work(f, work, app);
     draw_events(f, events, app);
     draw_footer(f, footer, app);
@@ -921,24 +1122,21 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
 fn draw_work(f: &mut Frame, area: Rect, app: &App) {
     let controlled: Vec<&Work> = app.work.iter().filter(|w| w.proc.controlled()).collect();
     let paused = controlled.iter().filter(|w| w.proc.stopped).count();
-    let total: f64 = controlled
-        .iter()
-        .map(|w| w.cpu.max(0.0))
-        .sum::<f64>()
-        .max(0.0);
+    let total: f64 = controlled.iter().map(|w| w.cpu.max(0.0)).sum();
     let title = format!(
-        "Processes · {} controlled · {paused} paused · {:.0}% CPU",
+        "Owners and processes · {} controlled · {paused} paused · {:.0}% CPU",
         controlled.len(),
         total
     );
     let block = panel(&title);
-    if app.work.is_empty() {
+    if app.items.is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
         f.render_widget(
             Paragraph::new(
-                "Nothing busy. Processes using CPU appear here: select one with ↑/↓ and press \
-                 Enter to control it.",
+                "Nothing busy. Busy work appears here under its owner (a Claude Code session, \
+                 a command in a terminal tab, an app): select one with ↑/↓ and press Enter to \
+                 control it.",
             )
             .wrap(ratatui::widgets::Wrap { trim: true })
             .fg(DIM),
@@ -947,47 +1145,87 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let header = Row::new(
-        ["PID", "STATE", "CPU", "CONTROL", "NAME"]
+        ["PID", "STATE", "CPU", "CONTROL", "OWNER / PROCESS"]
             .map(|h| Cell::from(h).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD))),
     );
+    let cpu_color = |cpu: f64| {
+        if cpu >= 100.0 {
+            HOT
+        } else if cpu >= 20.0 {
+            WARN
+        } else {
+            DIM
+        }
+    };
+    let mut owner = "";
     let rows: Vec<Row> = app
-        .work
+        .items
         .iter()
-        .map(|w| {
-            let p = &w.proc;
-            let (state, color) = match p.reason {
-                "" => ("○ free", DIM),
-                "excluded" | "released" => ("⊘ excluded", DIM),
-                _ if p.stopped => ("⏸ paused", WARN),
-                _ => ("▶ running", OK),
-            };
-            // What controls it: just this process, or the config rule that catches its kind.
-            let control = match p.reason {
-                "pid" => "this".to_string(),
-                "" => "—".to_string(),
-                "excluded" => "excluded".to_string(),
-                "released" => "released".to_string(),
-                r => format!("all ({r})"),
-            };
-            let cpu_color = if w.cpu >= 100.0 {
-                HOT
-            } else if w.cpu >= 20.0 {
-                WARN
-            } else {
-                DIM
-            };
-            let name = if p.controlled() { Color::White } else { DIM };
-            Row::new([
-                Cell::from(p.pid.to_string()).style(Style::new().fg(DIM)),
-                Cell::from(state).style(Style::new().fg(color)),
-                Cell::from(format!("{:>5.0}%", w.cpu)).style(Style::new().fg(cpu_color)),
-                Cell::from(control).style(Style::new().fg(if p.reason == "pid" {
-                    ACCENT
+        .map(|item| match item {
+            Item::Owner(o) => {
+                owner = &o.name;
+                let control = match o.choice {
+                    "this" => "its work".to_string(),
+                    "all" => format!("all {}", family_rule(&o.name).1),
+                    _ => "—".to_string(),
+                };
+                let on = !o.choice.is_empty();
+                Row::new([
+                    Cell::from(o.pid.to_string()).style(Style::new().fg(DIM)),
+                    Cell::from("◆ owner").style(Style::new().fg(ACCENT)),
+                    Cell::from(format!("{:>5.0}%", o.total))
+                        .style(Style::new().fg(cpu_color(o.total)).bold()),
+                    Cell::from(control).style(Style::new().fg(if on { ACCENT } else { DIM })),
+                    Cell::from(Line::from(vec![
+                        Span::styled(o.name.clone(), Style::new().fg(Color::White).bold()),
+                        Span::styled(format!("  {}", o.place), Style::new().fg(DIM)),
+                    ])),
+                ])
+            }
+            Item::Proc { idx, depth } => {
+                let w = &app.work[*idx];
+                let p = &w.proc;
+                let (state, color) = match p.reason {
+                    "" => ("○ free", DIM),
+                    "excluded" | "released" => ("⊘ excluded", DIM),
+                    _ if p.stopped => ("⏸ paused", WARN),
+                    _ => ("▶ running", OK),
+                };
+                // What controls it: its owner, just this process, or a rule for its kind.
+                let control = match p.reason {
+                    "owner" => "owner".to_string(),
+                    "pid" => "this".to_string(),
+                    "" => "—".to_string(),
+                    "excluded" => "excluded".to_string(),
+                    "released" => "released".to_string(),
+                    r => format!("all ({r})"),
+                };
+                let name = if p.controlled() { Color::White } else { DIM };
+                let tree = if p.pid == p.owner {
+                    "  · ".to_string()
                 } else {
-                    DIM
-                })),
-                Cell::from(p.name.clone()).style(Style::new().fg(name)),
-            ])
+                    format!("  {}└ ", "  ".repeat(*depth))
+                };
+                let label = if p.pid == p.owner {
+                    format!("{owner} (itself)")
+                } else {
+                    p.name.clone()
+                };
+                Row::new([
+                    Cell::from(p.pid.to_string()).style(Style::new().fg(DIM)),
+                    Cell::from(state).style(Style::new().fg(color)),
+                    Cell::from(format!("{:>5.0}%", w.cpu)).style(Style::new().fg(cpu_color(w.cpu))),
+                    Cell::from(control).style(Style::new().fg(if p.reason == "pid" {
+                        ACCENT
+                    } else {
+                        DIM
+                    })),
+                    Cell::from(Line::from(vec![
+                        Span::styled(tree, Style::new().fg(DIM)),
+                        Span::styled(label, Style::new().fg(name)),
+                    ])),
+                ])
+            }
         })
         .collect();
     let table = Table::new(
@@ -1008,10 +1246,7 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("▸");
-    let mut state = ratatui::widgets::TableState::default().with_selected(
-        app.selected
-            .and_then(|pid| app.work.iter().position(|w| w.proc.pid == pid)),
-    );
+    let mut state = ratatui::widgets::TableState::default().with_selected(app.selected_index());
     f.render_stateful_widget(table, area, &mut state);
 }
 
@@ -1093,6 +1328,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 mod tests {
     use super::*;
 
+    /// The tests that point GUVNOR_STATE somewhere take turns.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn set_target_keeps_comments_and_validates() {
         let dir = std::env::temp_dir().join(format!("guvnor-tui-{}", std::process::id()));
@@ -1122,7 +1360,46 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_an_owner_cycles_off_this_all_off() {
+        let _env = ENV.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("guvnor-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        unsafe {
+            std::env::set_var("GUVNOR_STATE", &dir);
+        }
+        // This test process stands in for the owner: it is alive, so its pin is kept.
+        let me = procs::info(std::process::id() as i32).unwrap();
+        let mut o = Owner {
+            pid: me.pid,
+            start: me.start,
+            name: "claude".into(),
+            place: String::new(),
+            total: 0.0,
+            choice: "",
+        };
+        let mut seen = vec![];
+        for _ in 0..3 {
+            let c = Config::load(&cfg).unwrap();
+            apply_owner(&o, &cfg, &c).unwrap();
+            let c = Config::load(&cfg).unwrap();
+            o.choice = if state::read_pins().owners.contains(&(me.pid, me.start)) {
+                "this"
+            } else if c.work.owners.contains(&"claude".to_string()) {
+                "all"
+            } else {
+                ""
+            };
+            seen.push(o.choice);
+        }
+        assert_eq!(seen, vec!["this", "all", ""]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn enter_cycles_off_this_all_off() {
+        let _env = ENV.lock().unwrap();
         // A scratch config and state, and a sleep that is not our child (our descendants are
         // protected from throttling, so they never count as work).
         let dir = std::env::temp_dir().join(format!("guvnor-cycle-{}", std::process::id()));
