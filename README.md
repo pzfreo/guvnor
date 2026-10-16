@@ -37,8 +37,8 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
 
 - each fan spinning at a speed that follows its rpm, on a bar with the target marked, coloured by
   zone: off, base, high, LIMIT;
-- the duty, the learned cap and the ceiling, and where the current period is: work running or
-  paused, with a countdown;
+- how much the work is allowed to run (the duty), and one line saying why: the die temperature
+  being held, full speed, or throttling off (the ceiling too, when it is below 100%);
 - the fan speed, the duty, the 1-minute load average (against the number of cores) and the die temperature (hottest reading each period, the mean of the die sensors, and the current
   setpoint) over the last hour, starting at 5 minutes and widening as history builds;
 - your work grouped by **owner**, one line each, busiest first, with its total CPU and how many of its processes rules already control. An owner is

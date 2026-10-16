@@ -976,7 +976,7 @@ fn draw_fan_bar(f: &mut Frame, area: Rect, rpm: f64, max: f64, target: u32, colo
 }
 
 fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
-    let block = panel("Duty cycle");
+    let block = panel("Work allowed");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let Some(s) = &app.status else {
@@ -996,7 +996,9 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
-    let [gauge, cap, phase, timeline] = Layout::vertical([Constraint::Length(1); 4]).areas(inner);
+    // How much the work gets to run, and one steady line saying why. Cycles are a second
+    // long in temperature mode, too fast to show as a countdown.
+    let [gauge, _, why] = Layout::vertical([Constraint::Length(1); 3]).areas(inner);
     let duty = if s.paused { 1.0 } else { s.duty };
     f.render_widget(
         Gauge::default()
@@ -1009,82 +1011,45 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
             .use_unicode(true),
         gauge,
     );
-    let cap_text = match (s.temp, s.setpoint, s.cap) {
-        (Some(t), Some(sp), _) => {
-            let avg = s.avg.map(|a| format!(" (avg {a:.0})")).unwrap_or_default();
-            format!(
-                "die {t:.0} °C{avg}, holding {sp:.0} °C · {} s cycle",
-                s.cycle
-            )
-        }
-        (_, Some(sp), _) => format!("holding {sp:.0} °C · {} s cycle", s.cycle),
-        (_, _, Some(c)) => format!("learned cap {:.0}%", c * 100.0),
-        _ => "no cap learned".into(),
+    let ceiling = if s.ceiling < 1.0 {
+        format!(" · ceiling {:.0}%", s.ceiling * 100.0)
+    } else {
+        String::new()
     };
-    f.render_widget(
-        Line::from(vec![
-            Span::styled(cap_text, Style::new().fg(DIM)),
-            Span::styled(
-                format!("  ·  ceiling {:.0}%", s.ceiling * 100.0),
-                Style::new().fg(DIM),
-            ),
-        ]),
-        cap,
-    );
-    let left = (s.phase_end - state::now()).max(0.0);
-    let (icon, text, color) = match s.phase.as_str() {
-        "run" => ("▶", format!("work running · pause in {left:.1} s"), OK),
-        "pause" => ("⏸", format!("work paused · resumes in {left:.1} s"), WARN),
-        "full" => ("▶", "work at full speed · nothing paused".into(), OK),
-        "stagger" => {
+    let (text, color) = match (s.phase.as_str(), s.setpoint) {
+        ("off", _) => ("throttling off · all work runs freely".to_string(), WARN),
+        ("full", Some(sp)) => (format!("full speed · the die is under {sp:.0} °C"), OK),
+        ("full", None) => ("full speed".to_string(), OK),
+        ("stagger", _) => {
             let work: Vec<&Work> = app.work.iter().filter(|w| w.proc.controlled()).collect();
             let running = work.iter().filter(|w| !w.proc.stopped).count();
             (
-                "▶",
-                format!(
-                    "staggered: each runs {:.0}% of every {} s · {running} of {} running",
-                    s.duty * 100.0,
-                    s.cycle,
-                    work.len()
-                ),
-                OK,
+                format!("staggered · {running} of {} running", work.len()),
+                Color::Gray,
             )
         }
-        _ => (
-            "○",
-            "throttling off: all work runs freely (t to turn on)".into(),
-            WARN,
-        ),
+        (_, Some(sp)) => {
+            let now = s
+                .temp
+                .map(|t| format!(" · now {t:.0} °C"))
+                .unwrap_or_default();
+            (format!("holding the die at {sp:.0} °C{now}"), Color::Gray)
+        }
+        (_, None) => match s.cap {
+            Some(c) => (
+                format!("fan rules · learned cap {:.0}%", c * 100.0),
+                Color::Gray,
+            ),
+            None => ("fan rules".to_string(), Color::Gray),
+        },
     };
     f.render_widget(
-        Line::from(Span::styled(
-            format!("{icon} {text}"),
-            Style::new().fg(color).bold(),
-        )),
-        phase,
+        Line::from(vec![
+            Span::styled(text, Style::new().fg(color)),
+            Span::styled(ceiling, Style::new().fg(DIM)),
+        ]),
+        why,
     );
-    // This period as a strip: run part, pause part, and where we are now.
-    let w = timeline.width as usize;
-    if w > 0 && (s.phase == "run" || s.phase == "pause") {
-        let cycle = if s.cycle > 0.0 { s.cycle } else { s.period };
-        let run_w = (s.duty * w as f64).round() as usize;
-        let elapsed = match s.phase.as_str() {
-            "run" => s.duty * cycle - left,
-            _ => cycle - left,
-        };
-        let now_x = ((elapsed / cycle).clamp(0.0, 1.0) * (w - 1) as f64) as usize;
-        let spans: Vec<Span> = (0..w)
-            .map(|x| {
-                let c = if x < run_w { OK } else { WARN };
-                if x == now_x {
-                    Span::styled("◆", Style::new().fg(Color::White).bold())
-                } else {
-                    Span::styled("▬", Style::new().fg(c))
-                }
-            })
-            .collect();
-        f.render_widget(Line::from(spans), timeline);
-    }
 }
 
 fn draw_charts(f: &mut Frame, area: Rect, app: &App) {
