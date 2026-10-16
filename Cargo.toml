@@ -2,6 +2,8 @@
 name = "guvnor"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/pzfreo/guvnor"
 
 [dependencies]
 core-foundation = "0.10.1"

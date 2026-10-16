@@ -234,3 +234,7 @@ each time that no process stays stopped, in both modes. They throttle only their
 processes. Stop a running governor before `cargo test`: it would throttle the tests too.
 
 `reference/` holds the prototype (`fan.c`, `fangov.py`) this was ported from.
+
+## Licence
+
+Apache License 2.0: see [LICENSE](LICENSE).
