@@ -177,6 +177,14 @@ impl Ctl {
         }
     }
 
+    /// The die readings alone, for the history while throttling is off.
+    fn peek(&self, smc: &Smc) -> Option<(f64, f64)> {
+        match self {
+            Ctl::Fans(_) => None,
+            Ctl::Temp(_, keys) => smc.temps(keys),
+        }
+    }
+
     fn setpoint(&self) -> Option<f64> {
         match self {
             Ctl::Fans(_) => None,
@@ -429,7 +437,12 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 dog.beat();
                 std::thread::sleep(Duration::from_millis(50));
             }
-            if !paused && let Some(r) = ctl.inner(&smc, cycle, out.ceiling) {
+            let reading = if paused {
+                ctl.peek(&smc)
+            } else {
+                ctl.inner(&smc, cycle, out.ceiling)
+            };
+            if let Some(r) = reading {
                 out.read(r, &mut temps);
             }
             continue;

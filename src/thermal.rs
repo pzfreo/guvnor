@@ -107,6 +107,8 @@ impl Thermal {
         // The fast loop already holds the die, so falling fans mean the setpoint is working: no
         // cut, even above LIMIT, until they stop falling. After a cut, also wait cut_hold periods.
         let falling = rpm < self.last_rpm;
+        // More than jitter: the fans are answering heat already.
+        let rising = rpm > self.last_rpm + 50;
         let held = falling || (self.recovering && r.cut_hold > 0 && self.since_cut <= r.cut_hold);
         self.last_rpm = rpm;
         let reason;
@@ -129,8 +131,9 @@ impl Thermal {
             self.since_cut = 0;
             self.recovering = true;
         } else {
-            // Fans off, or well below the target and the setpoint well under the one that last
-            // overshot: plenty of room, so rise at the fast rate.
+            // Fans off: plenty of room, so rise at the fast rate. Well below the target (and the
+            // setpoint well under the one that last overshot): rise every period while the fans
+            // hold still, and wait while they rise, since they are answering heat already.
             let off = rpm < r.off_below;
             let near = self
                 .over
@@ -147,9 +150,15 @@ impl Thermal {
                 self.slow = 1;
                 self.over = None;
             }
+            if below && rising {
+                self.ticks = 0;
+                return None;
+            }
             self.ticks += 1;
             if self.ticks
-                < if off || below {
+                < if below {
+                    1
+                } else if off {
                     r.off_every
                 } else {
                     r.base_every * self.slow
@@ -343,13 +352,21 @@ mod tests {
 
     #[test]
     fn fans_well_below_a_high_target_raise_the_setpoint_quickly() {
-        // Target 5000 with the fans at 2900: one step per off_every periods, not per base_every.
+        // Target 5000 with the fans holding at 2900: one step a period (after the first reading,
+        // which looks like a rise from nothing).
         let mut c = Thermal::new(Rules::default(), Temperature::default(), 1.0);
         let start = c.setpoint();
-        for _ in 0..30 {
+        for _ in 0..11 {
             c.outer(2900, 5000);
         }
         assert_eq!(c.setpoint(), start + 10.0);
+        // While the fans rise they are answering heat already: wait for them.
+        for rpm in [3000, 3200, 3400, 3600] {
+            assert_eq!(c.outer(rpm, 5000), None);
+        }
+        assert_eq!(c.setpoint(), start + 10.0);
+        c.outer(3600, 5000);
+        assert_eq!(c.setpoint(), start + 11.0);
         // At a 2500 target, base speed is at the target: the slow rate.
         let mut c = Thermal::new(Rules::default(), Temperature::default(), 1.0);
         for _ in 0..30 {
@@ -360,7 +377,7 @@ mod tests {
 
     #[test]
     fn after_an_overshoot_the_climb_back_slows_near_the_setpoint_that_caused_it() {
-        // As overnight at a 4000 target: the setpoint climbed 1 °C every 30 s while the lagging
+        // As overnight at a 4000 target: the setpoint climbed while the lagging
         // fans sat below the target, reached 95 °C, and the fans shot to 5000 every 15 minutes.
         let t = Temperature {
             start: 95.0,
@@ -381,7 +398,7 @@ mod tests {
             c.outer(3600, 4000);
             periods += 1;
         }
-        assert_eq!(periods, 6 * 3);
+        assert_eq!(periods, 6);
         for _ in 0..11 {
             c.outer(3600, 4000);
         }
