@@ -306,7 +306,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     };
     let mut model = input.map(|i| {
         state::read_model()
-            .filter(|m| m.input == i)
+            .filter(|m| m.fits(i))
             .unwrap_or_else(|| Model::new(i))
     });
     let mut observed = 0u32;
