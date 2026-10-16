@@ -39,6 +39,9 @@ pub struct Thermal {
     last_rpm: u32,
     /// Base-speed rises wait base_every × this; each cut doubles it (up to 8), fans off resets it.
     slow: u32,
+    /// The setpoint that last overshot. Below the target, rises are fast only while the setpoint
+    /// is well under it: the fans lag the die by minutes, so a fast climb past it overshoots again.
+    over: Option<f64>,
 }
 
 impl Thermal {
@@ -57,6 +60,7 @@ impl Thermal {
             recovering: false,
             last_rpm: 0,
             slow: 1,
+            over: None,
         }
     }
 
@@ -119,14 +123,17 @@ impl Thermal {
             if !self.recovering {
                 // Only the first cut of an overshoot says a probe went too far.
                 self.slow = (self.slow * 2).min(8);
+                self.over = Some(old);
             }
             self.ticks = 0;
             self.since_cut = 0;
             self.recovering = true;
         } else {
-            // Fans off, or well below the target: plenty of room, so rise at the fast rate.
+            // Fans off, or well below the target and the setpoint well under the one that last
+            // overshot: plenty of room, so rise at the fast rate.
             let off = rpm < r.off_below;
-            let below = !off && rpm + r.high_above < target;
+            let near = self.over.is_some_and(|o| self.setpoint + 2.0 * self.t.step >= o);
+            let below = !off && rpm + r.high_above < target && !near;
             reason = if off {
                 Reason::Off
             } else if below {
@@ -134,8 +141,9 @@ impl Thermal {
             } else {
                 Reason::Base
             };
-            if off || below {
+            if off {
                 self.slow = 1;
+                self.over = None;
             }
             self.ticks += 1;
             if self.ticks
@@ -346,6 +354,43 @@ mod tests {
             c.outer(2550, 2500);
         }
         assert_eq!(c.setpoint(), start + 5.0);
+    }
+
+    #[test]
+    fn after_an_overshoot_the_climb_back_slows_near_the_setpoint_that_caused_it() {
+        // As overnight at a 4000 target: the setpoint climbed 1 °C every 30 s while the lagging
+        // fans sat below the target, reached 95 °C, and the fans shot to 5000 every 15 minutes.
+        let t = Temperature {
+            start: 95.0,
+            ..Temperature::default()
+        };
+        let mut c = Thermal::new(Rules::default(), t, 1.0);
+        c.outer(4900, 4000);
+        assert_eq!(c.setpoint(), 91.0);
+        c.outer(5000, 4000);
+        c.outer(4700, 4000);
+        for _ in 0..4 {
+            c.outer(4800, 4000);
+        }
+        assert_eq!(c.setpoint(), 87.0);
+        // Fans fall below the target: fast up to 2 steps short of 95, then the slow rate.
+        let mut periods = 0;
+        while c.setpoint() < 93.0 {
+            c.outer(3600, 4000);
+            periods += 1;
+        }
+        assert_eq!(periods, 6 * 3);
+        for _ in 0..11 {
+            c.outer(3600, 4000);
+        }
+        assert_eq!(c.setpoint(), 93.0, "base_every × slow (12 periods) per step");
+        c.outer(3600, 4000);
+        assert_eq!(c.setpoint(), 94.0);
+        // Fans off: the load has gone, so the fast rate again.
+        for _ in 0..3 {
+            c.outer(1500, 4000);
+        }
+        assert_eq!(c.setpoint(), 95.0);
     }
 
     #[test]
