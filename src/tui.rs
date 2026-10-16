@@ -800,7 +800,7 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<(), String> {
 }
 
 /// A colour key for a chart, as a second title: "━ rpm  ━ target …".
-fn key_line(items: &[(&'static str, Color)]) -> Line<'static> {
+fn key_line(items: &[(&str, Color)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for &(name, color) in items {
         spans.push(Span::styled("━ ", Style::new().fg(color).bold()));
@@ -1203,10 +1203,16 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
         .iter()
         .filter_map(|s| s.temp.map(|t| (s.t - now, t)))
         .collect();
-    let set: Vec<(f64, f64)> = samples
-        .iter()
-        .filter_map(|s| s.setpoint.map(|t| (s.t - now, t)))
-        .collect();
+    // The setpoint now, as one point at the right edge: a line of it hides behind the others.
+    let setpoint = app
+        .status
+        .as_ref()
+        .and_then(|s| s.setpoint)
+        .or_else(|| samples.last().and_then(|s| s.setpoint));
+    let set: Vec<(f64, f64)> = setpoint.map(|t| (0.0, t)).into_iter().collect();
+    let set_key = setpoint
+        .map(|t| format!("setpoint {t:.0}°"))
+        .unwrap_or_else(|| "setpoint".into());
     let avg: Vec<(f64, f64)> = samples
         .iter()
         .filter_map(|s| s.avg.map(|t| (s.t - now, t)))
@@ -1214,7 +1220,7 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
     let block = panel("Die temperature").title(key_line(&[
         ("hottest", HOT),
         ("average", AVG),
-        ("setpoint", TARGET),
+        (&set_key, TARGET),
     ]));
     if temps.is_empty() {
         let inner = block.inner(area);
@@ -1234,11 +1240,6 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
         Dataset::default()
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::new().fg(TARGET))
-            .data(&set),
-        Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
             .style(Style::new().fg(AVG))
             .data(&avg),
         Dataset::default()
@@ -1246,6 +1247,11 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
             .graph_type(GraphType::Line)
             .style(Style::new().fg(HOT))
             .data(&temps),
+        Dataset::default()
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::new().fg(TARGET))
+            .data(&set),
     ])
     .block(block)
     .x_axis(
