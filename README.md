@@ -5,6 +5,8 @@ builds, tests, renders — uses as much CPU as that allows. It throttles only th
 never the whole machine: each 10 s period the work runs for `duty × period` and is paused with
 SIGSTOP for the rest, and the duty follows the fans.
 
+![The guvnor dashboard: fan speed, duty, die temperature, and the work grouped by owner](docs/dashboard.png)
+
 ## How it differs
 
 - **App Tamer** throttles per app to a CPU percentage you choose. guvnor chooses the amount
