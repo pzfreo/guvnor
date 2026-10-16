@@ -39,11 +39,11 @@ Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or 
   paused, with a countdown;
 - the fan speed, the duty and the die temperature (hottest reading each period, with the
   setpoint) over the last hour, starting at 5 minutes and widening as history builds;
-- your work grouped by **owner**, busiest owner first, with each owner's total CPU. An owner is
+- your work grouped by **owner**, one line each, busiest first, with its total CPU and how many of its processes rules already control. An owner is
   what you started: a Claude Code session or a command in a terminal tab (the first process below
   the terminal, login, ssh, tmux and their shell), or an app for its helpers. It shows with its
   current directory, so sessions in different repos are told apart. Under it, as a tree, its
-  processes using 1% CPU or more or controlled (running or paused, and what controls them);
+  processes, for the selected owner only: those using 1% CPU or more or controlled (running or paused, and what controls them);
   owners using under 5% with nothing controlled are left out;
 - the governor's recent events, coloured.
 

@@ -48,6 +48,10 @@ struct Owner {
     total: f64,
     /// "this" (chosen in the dashboard), "all" (a config rule on its name) or "".
     choice: &'static str,
+    /// How many of its processes are controlled, by any rule.
+    controlled: usize,
+    /// Whether its processes are listed below it: only the selected owner's are.
+    open: bool,
 }
 
 /// One line of the process table: an owner, or a process under it at some depth.
@@ -229,6 +233,8 @@ impl App {
             None => 0,
         };
         self.selected = Some(self.items[i].key(&self.work));
+        // Open the owner just moved onto at once.
+        self.items = items(&self.work, &self.config.work, self.selected);
     }
 
     /// Enter: the selected owner or process moves to its next control state.
@@ -438,9 +444,10 @@ fn apply(
     Ok(msg)
 }
 
-/// Groups the processes by owner. An owner is listed when its work is busy (5% or more), when
-/// any of it is controlled, or when it is chosen; under it go its processes that are busy (1%
-/// or more) or controlled, as a tree with the idle ones between them left out.
+/// Groups the processes by owner, one line each. An owner is listed when its work is busy (5%
+/// or more), when any of it is controlled, or when it is chosen. Under the selected owner (the
+/// busiest when nothing is selected) go its processes that are busy (1% or more) or
+/// controlled, as a tree with the idle ones between them left out.
 fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> Vec<Item> {
     let pins = state::read_pins();
     let owner_rule = (!rules.owners.is_empty())
@@ -492,12 +499,18 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
         {
             continue;
         }
+        // Apps run in /: say nothing rather than that.
         let place = procs::cwd(pid)
+            .filter(|c| c != "/")
             .map(|c| match c.strip_prefix(&home) {
                 Some(rest) if !home.is_empty() => format!("~{rest}"),
                 _ => c,
             })
             .unwrap_or_default();
+        let controlled = members
+            .iter()
+            .filter(|&&i| work[i].proc.controlled())
+            .count();
         let members: Vec<usize> = members.into_iter().filter(|&i| shown(i)).collect();
         owners.push((
             Owner {
@@ -507,11 +520,18 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
                 place,
                 total,
                 choice,
+                controlled,
+                open: has_selected,
             },
             members,
         ));
     }
     owners.sort_by(|a, b| b.0.total.total_cmp(&a.0.total).then(a.0.pid.cmp(&b.0.pid)));
+    if !owners.iter().any(|o| o.0.open)
+        && let Some(first) = owners.first_mut()
+    {
+        first.0.open = true;
+    }
 
     let mut out = vec![];
     for (owner, members) in owners {
@@ -545,7 +565,11 @@ fn items(work: &[Work], rules: &config::Work, selected: Option<(i32, bool)>) -> 
             }
         }
         let owner_pid = owner.pid;
+        let open = owner.open;
         out.push(Item::Owner(owner));
+        if !open {
+            continue;
+        }
         let mut stack: Vec<(usize, usize)> = vec![];
         let push = |stack: &mut Vec<(usize, usize)>, parent: i32, depth: usize| {
             let mut list = kids.get(&parent).cloned().unwrap_or_default();
@@ -1169,10 +1193,15 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
                     "all" => format!("all {}", family_rule(&o.name).1),
                     _ => "—".to_string(),
                 };
+                let control = match (control.as_str(), o.controlled) {
+                    ("—", n) if n > 0 => format!("{n} by rule"),
+                    _ => control,
+                };
                 let on = !o.choice.is_empty();
+                let mark = if o.open { "▾ owner" } else { "▹ owner" };
                 Row::new([
                     Cell::from(o.pid.to_string()).style(Style::new().fg(DIM)),
-                    Cell::from("◆ owner").style(Style::new().fg(ACCENT)),
+                    Cell::from(mark).style(Style::new().fg(ACCENT)),
                     Cell::from(format!("{:>5.0}%", o.total))
                         .style(Style::new().fg(cpu_color(o.total)).bold()),
                     Cell::from(control).style(Style::new().fg(if on { ACCENT } else { DIM })),
@@ -1245,7 +1274,8 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
             .bg(Color::Rgb(38, 52, 70))
             .add_modifier(Modifier::BOLD),
     )
-    .highlight_symbol("▸");
+    .highlight_symbol("▸")
+    .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
     let mut state = ratatui::widgets::TableState::default().with_selected(app.selected_index());
     f.render_stateful_widget(table, area, &mut state);
 }
@@ -1378,6 +1408,8 @@ mod tests {
             place: String::new(),
             total: 0.0,
             choice: "",
+            controlled: 0,
+            open: false,
         };
         let mut seen = vec![];
         for _ in 0..3 {
