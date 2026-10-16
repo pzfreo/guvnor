@@ -1316,9 +1316,22 @@ fn draw_work(f: &mut Frame, area: Rect, app: &App) {
                     1 => "  owns 1 process".to_string(),
                     n => format!("  owns {n} processes"),
                 };
+                // Its controlled processes, read at each draw like the process lines: all
+                // paused, all running, or some of each.
+                let (n, stopped) = app
+                    .work
+                    .iter()
+                    .filter(|w| w.proc.owner == o.pid && w.proc.controlled())
+                    .fold((0, 0), |(n, s), w| (n + 1, s + w.proc.stopped as usize));
+                let (state, color) = match (n, stopped) {
+                    (0, _) => ("○ free".to_string(), DIM),
+                    (n, s) if s == n => ("⏸ paused".to_string(), WARN),
+                    (_, 0) => ("▶ running".to_string(), OK),
+                    (n, s) => (format!("⏸ {s}/{n}"), WARN),
+                };
                 Row::new([
                     Cell::from(o.pid.to_string()).style(Style::new().fg(DIM)),
-                    Cell::from("◆ owner").style(Style::new().fg(ACCENT).bold()),
+                    Cell::from(state).style(Style::new().fg(color).bold()),
                     Cell::from(format!("{:>5.0}%", o.total))
                         .style(Style::new().fg(cpu_color(o.total)).bold()),
                     Cell::from(control).style(Style::new().fg(if on { ACCENT } else { DIM })),
