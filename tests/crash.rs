@@ -261,16 +261,16 @@ fn pause_continues_everything_and_resume_throttles_again() {
     rig.start();
     rig.wait_for(true, 6.0)
         .expect("governor never paused the victim");
-    assert!(rig.cmd("pause").status().unwrap().success());
+    assert!(rig.cmd("off").status().unwrap().success());
     assert!(!rig.stopped());
     rig.never_stopped(2.0 * PERIOD);
     let out = rig.cmd("status").output().unwrap();
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("paused"),
+        String::from_utf8_lossy(&out.stdout).contains("throttling off"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(rig.cmd("resume").status().unwrap().success());
+    assert!(rig.cmd("on").status().unwrap().success());
     rig.wait_for(true, 2.0 * PERIOD + 1.0)
         .expect("resume did not throttle again");
 }

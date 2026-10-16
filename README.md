@@ -67,7 +67,7 @@ Keys:
     `sheets-[0-9a-f]{16}`.
   - **off**: removes that rule, or, if another rule still catches the process, adds it to
     `exclude_names`.
-- `p` pauses or resumes throttling; `+` / `-` move the target by 100 rpm; `q` quits.
+- `t` turns throttling off (all work runs freely) or on again; `+` / `-` move the target by 100 rpm; `q` quits.
 
 Config changes keep the file's comments, and the governor applies them within a period. With no
 governor running the dashboard still shows the fans and your processes.
@@ -79,8 +79,8 @@ governor running the dashboard still shows the fans and your processes.
 | `guvnor` | the live dashboard |
 | `guvnor run` | run in the foreground, logging each duty change with the rpm |
 | `guvnor status` | the governor's duty, the fans, the power source, the matched processes |
-| `guvnor pause` | throttling off and every work process continued, until `resume` (survives restarts) |
-| `guvnor resume` | throttling on |
+| `guvnor off` | throttling off: every work process continued and left to run freely, until `on` (survives restarts; `pause` also works) |
+| `guvnor on` | throttling on (`resume` also works) |
 | `guvnor install` / `uninstall` | add / remove the LaunchAgent |
 | `guvnor config` | print the default config |
 | `guvnor fans` | print the fans, e.g. `fan0 2312/7826 fan1 2495/7826` |
@@ -194,7 +194,7 @@ this:
    signals don't reach it) gets a heartbeat over a pipe at least every 100 ms. If the pipe closes
    (the governor exited or was killed) it continues them all at once; if the heartbeat stops for
    a second (the governor hung) it continues them and keeps watching. If both are killed, the
-   LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor pause`.
+   LaunchAgent's restart continues them, and so does `guvnor status` or `guvnor off`.
 3. **Every pause is bounded**: no longer than `cycle × (1 − floor)`: 0.95 s in temperature mode,
    8 s with the fan rules. If the governor hangs, the watchdog continues the work within a
    second of the last heartbeat.
@@ -206,14 +206,14 @@ another user's process, or a process already stopped by someone else (Ctrl-Z).
 
 - **Throttled work takes longer in wall-clock time.** Tests with wall-time timeouts can fail, and
   timing benchmarks are meaningless while throttled. Measure work in instructions retired
-  (`/usr/bin/time -l`), not wall time, or `guvnor pause` first.
+  (`/usr/bin/time -l`), not wall time, or `guvnor off` first.
 - **Rules match broadly.** A rule like `exes = ["/(release|debug)/"]` throttles every build and
   test binary of yours, including ones another session or tool started. The dashboard and
   `guvnor status` list what is controlled and why. `cmdlines` (the prototype's `pgrep -f`) also
   catches shells and scripts that merely mention the text, so prefer `names` or `exes`.
 - **A process paused mid-network-exchange** can time out at the other end, as with any SIGSTOP.
 - If both the governor and its watchdog are killed while no LaunchAgent is installed (a
-  foreground `guvnor run`), work stays paused until you run `guvnor status`, `guvnor pause` or
+  foreground `guvnor run`), work stays paused until you run `guvnor status`, `guvnor off` or
   `guvnor run`, or `kill -CONT` it.
 
 ## Uninstall
@@ -231,7 +231,7 @@ its setpoint at light to very heavy loads, and keeps a lagging fan at base speed
 converge at a 2500 target, beat the prototype's, and follow load changes. Both cases from the live
 runs (a hot start ratcheting the cap or setpoint down) are covered. Also tested: the config, the process matcher, and the crash
 safety of the real binary. Those tests kill the governor with SIGKILL mid-pause, kill it together
-with its watchdog, hang it with SIGSTOP, stop it with SIGTERM, and use `pause`/`resume`, checking
+with its watchdog, hang it with SIGSTOP, stop it with SIGTERM, and use `off`/`on`, checking
 each time that no process stays stopped, in both modes. They throttle only their own `sleep`
 processes. Stop a running governor before `cargo test`: it would throttle the tests too.
 

@@ -267,7 +267,7 @@ impl App {
                 .map(|_| "throttling on".to_string())
                 .map_err(|e| e.to_string())
         } else {
-            crate::pause(&self.config).map(|_| "throttling off; all work continued".to_string())
+            crate::pause(&self.config).map(|_| "throttling off; all work runs freely".to_string())
         };
         match result {
             Ok(m) => self.say(m),
@@ -772,7 +772,7 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<(), String> {
             match k.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-                KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
+                KeyCode::Char('t') | KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
                 KeyCode::Char('+') | KeyCode::Char('=') => app.nudge_target(100),
                 KeyCode::Char('-') => app.nudge_target(-100),
                 KeyCode::Up | KeyCode::Char('k') => app.select(-1),
@@ -860,9 +860,10 @@ fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let pill = match &app.status {
-        Some(s) if s.paused => {
-            Span::styled(" ⏸ PAUSED ", Style::new().fg(Color::Black).bg(WARN).bold())
-        }
+        Some(s) if s.paused => Span::styled(
+            " ○ THROTTLING OFF ",
+            Style::new().fg(Color::Black).bg(WARN).bold(),
+        ),
         Some(s) if s.phase == "full" => Span::styled(
             " ● FULL SPEED ",
             Style::new().fg(Color::Black).bg(OK).bold(),
@@ -1046,7 +1047,11 @@ fn draw_duty(f: &mut Frame, area: Rect, app: &App) {
                 OK,
             )
         }
-        _ => ("⏸", "throttling off (guvnor resume or p)".into(), WARN),
+        _ => (
+            "○",
+            "throttling off: all work runs freely (t to turn on)".into(),
+            WARN,
+        ),
     };
     f.render_widget(
         Line::from(Span::styled(
@@ -1518,7 +1523,7 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App) {
             let color = if msg.contains("(Limit)") || msg.contains("error") {
                 HOT
             } else if msg.contains("(High)")
-                || msg.starts_with("paused")
+                || msg.starts_with("throttling off")
                 || msg.starts_with("watchdog")
             {
                 WARN
@@ -1549,9 +1554,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         )
     };
     let pause = if state::paused() {
-        " resume  "
+        " throttling on  "
     } else {
-        " pause  "
+        " throttling off  "
     };
     let mut spans = vec![
         key("↑↓"),
@@ -1560,7 +1565,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" open  "),
         key("⏎"),
         Span::raw(" control: off → this → all  "),
-        key("p"),
+        key("t"),
         Span::raw(pause),
         key("+/-"),
         Span::raw(" target  "),

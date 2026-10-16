@@ -296,7 +296,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     };
     log(&format!(
         "start: fan {rpm} rpm, target {target} rpm, {how}, all cores; continued {n} work processes{}",
-        if was_paused { "; paused" } else { "" }
+        if was_paused { "; throttling off" } else { "" }
     ));
 
     let mut next_outer = Instant::now();
@@ -324,9 +324,9 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         let paused = state::paused();
         if paused != was_paused {
             log(if paused {
-                "paused: throttling off"
+                "throttling off"
             } else {
-                "resumed: throttling on"
+                "throttling on"
             });
             was_paused = paused;
         }

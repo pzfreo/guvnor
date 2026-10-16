@@ -60,8 +60,8 @@ const USAGE: &str = "usage: guvnor [command]
   (none)      the live dashboard (or status, when not in a terminal)
   run         run the governor in the foreground, logging to stdout
   status      show the fans, the duty and the matched work processes
-  pause       stop throttling and continue all work (persists until resume)
-  resume      start throttling again
+  off         throttling off: all work runs freely (persists until `on`; also `pause`)
+  on          throttling on again (also `resume`)
   install     add a per-user LaunchAgent (KeepAlive) that runs `guvnor run`
   uninstall   remove it, continuing all work
   config      print a commented config file with the defaults
@@ -86,10 +86,10 @@ fn main() {
         Some("run") => governor::run(config::default_path()),
         None if tty => tui::run(),
         None | Some("status") => load().map(|c| status(&c)),
-        Some("pause") => load().and_then(|c| pause(&c)).map(|_| {
-            println!("throttling off; all work continued (guvnor resume to turn it back on)")
+        Some("off" | "pause") => load().and_then(|c| pause(&c)).map(|_| {
+            println!("throttling off; all work runs freely (guvnor on to turn it back on)")
         }),
-        Some("resume") => state::set_paused(false)
+        Some("on" | "resume") => state::set_paused(false)
             .map_err(|e| e.to_string())
             .map(|_| println!("throttling on")),
         Some("install") => launchd::install(),
@@ -220,7 +220,7 @@ fn status(c: &config::Config) {
                 .map(|c| format!(", cap {:.0}%", c * 100.0))
                 .unwrap_or_default();
             let state = if s.paused {
-                "paused (throttling off)".to_string()
+                "throttling off".to_string()
             } else {
                 let avg = s.avg.map(|a| format!(" (avg {a:.0})")).unwrap_or_default();
                 let die = match (s.temp, s.setpoint) {
@@ -237,7 +237,7 @@ fn status(c: &config::Config) {
         None => println!(
             "governor: not running{}",
             if state::paused() {
-                " (pause flag set)"
+                " (throttling off)"
             } else {
                 ""
             }
