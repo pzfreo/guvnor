@@ -1264,9 +1264,27 @@ fn draw_temps(f: &mut Frame, area: Rect, app: &App, samples: &[Sample], now: f64
         .iter()
         .filter_map(|s| s.avg.map(|t| (s.t - now, t)))
         .collect();
+    // The latest readings, beside their lines.
+    let latest = |now: Option<f64>, name: &str| {
+        now.map(|t| format!("{name} {t:.0}°"))
+            .unwrap_or_else(|| name.into())
+    };
+    let status = app.status.as_ref();
+    let hot_key = latest(
+        status
+            .and_then(|s| s.temp)
+            .or_else(|| samples.last().and_then(|s| s.temp)),
+        "hottest",
+    );
+    let avg_key = latest(
+        status
+            .and_then(|s| s.avg)
+            .or_else(|| samples.last().and_then(|s| s.avg)),
+        "average",
+    );
     let block = panel("Die temperature").title(key_line(&[
-        ("hottest", HOT),
-        ("average", AVG),
+        (&hot_key, HOT),
+        (&avg_key, AVG),
         (&set_key, TARGET),
     ]));
     if temps.is_empty() {
