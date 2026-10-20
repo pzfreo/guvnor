@@ -106,18 +106,16 @@ an error. `guvnor config` prints them all with comments. In short:
   and all its descendants), `exclude_names` (never, whatever else matches), and `idle_below` (1: work using less than 1% of a core over the last 10 s, counting only the time it was let run, is left running, since pausing it saves no heat; a new process is judged by its average since it started; 0 pauses all work). `guvnor config`
   shows examples for Rust, C/C++, Python and media tools.
 - `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
-- `[learn]`: `mode` (`"auto"`). The fans follow the heat being produced, smoothed over a
-  few minutes. guvnor learns this machine's curve from slowly smoothed heat (CPU power, `PSTR`,
-  or the mean die temperature where there is no power reading) to fan speed, keeps it in
-  `model.json` in the state directory, and keeps adapting it. It predicts the fans a minute
-  ahead as a movement from where they are, by how much that curve says the recent heat will move
-  them; with steady heat, no change (the dashboard draws the prediction). With `"auto"`, once it has checked an hour of
-  predictions and they are within 250 rpm on average and clearly better than assuming the fans
-  stay as they are, the fan rules act on the predicted speed
-  when it is higher than the actual one, so the setpoint stops climbing before the fans
-  overshoot. `"record"` only learns and shows it; `"off"` does neither. Whatever the mode, each period is also appended to
-  `trace.csv` in the state directory (about 0.5 MB a day; past 8 MB it moves to `trace.1.csv`),
-  a record of how this machine's fans behave, for judging models against.
+
+Each period is appended to `trace.csv` in the state directory (about 0.5 MB a day; past 8 MB it
+moves to `trace.1.csv`): time, fan speed, target, CPU power (`PSTR`), hottest and mean die
+temperature, setpoint, duty, load average and whether throttling was on, a record of how this
+machine's fans behave. Four days of it on a Mac17,7 retired an earlier fan model, which predicted
+the fans a minute ahead: they act as a thermostat on the die, climbing about 400 rpm per 10 s once
+the mean die passes about 91 °C and falling below about 75 °C, within 10 s of the die changing.
+Where they will be in a minute depends on load not yet seen; the best model beat assuming no
+change by 3.5%. Holding the die below where the fans climb, as the temperature loop does, is what
+works.
 
 The governor notices a changed config at the next period and applies it, logging `config
 reloaded`. A config with an error is logged and ignored, and the previous settings stay.

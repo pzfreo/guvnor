@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
@@ -103,9 +103,6 @@ pub struct Status {
     /// Seconds per duty cycle (the temperature loop's, or the period).
     #[serde(default)]
     pub cycle: f64,
-    /// The fan model's state, one line.
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -123,11 +120,9 @@ pub struct Sample {
     /// The 1-minute load average.
     #[serde(default)]
     pub load: Option<f64>,
-    /// The fan model's input (watts, or °C) and its fan speed predicted a minute ahead.
+    /// CPU power (`PSTR`, watts) at the end of the period, where the SMC has it.
     #[serde(default)]
     pub heat: Option<f64>,
-    #[serde(default)]
-    pub predicted: Option<f64>,
 }
 
 /// The 1-minute load average.
@@ -157,13 +152,17 @@ pub struct Pins {
 }
 
 /// A long record of the periods, for working out how this machine's fans behave: one line per
-/// period in trace.csv. Past 8 MB (about two weeks) it becomes trace.1.csv, replacing the one
-/// before.
+/// period in trace.csv. Past 8 MB (about two weeks), or written with other columns, it becomes
+/// trace.1.csv, replacing the one before.
 pub fn append_trace(s: &Sample, target: u32, throttling: bool) {
-    const HEADER: &str =
-        "time,rpm,target,heat,predicted,hottest,average,setpoint,duty,load,throttling\n";
+    const HEADER: &str = "time,rpm,target,heat,hottest,average,setpoint,duty,load,throttling\n";
     let path = dir().join("trace.csv");
-    if fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) {
+    let other_columns = || {
+        let mut head = [0u8; HEADER.len()];
+        fs::File::open(&path)
+            .is_ok_and(|mut f| f.read_exact(&mut head).is_err() || head != HEADER.as_bytes())
+    };
+    if fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) || other_columns() {
         let _ = fs::rename(&path, dir().join("trace.1.csv"));
     }
     let new = !path.exists();
@@ -172,13 +171,12 @@ pub fn append_trace(s: &Sample, target: u32, throttling: bool) {
     };
     let o = |v: Option<f64>| v.map(|v| format!("{v:.2}")).unwrap_or_default();
     let line = format!(
-        "{}{:.1},{},{},{},{},{},{},{},{:.3},{},{}\n",
+        "{}{:.1},{},{},{},{},{},{},{:.3},{},{}\n",
         if new { HEADER } else { "" },
         s.t,
         s.rpm,
         target,
         o(s.heat),
-        o(s.predicted),
         o(s.temp),
         o(s.avg),
         o(s.setpoint),
@@ -187,15 +185,6 @@ pub fn append_trace(s: &Sample, target: u32, throttling: bool) {
         throttling as u8
     );
     let _ = f.write_all(line.as_bytes());
-}
-
-/// The fan model, kept across restarts: it is this machine's.
-pub fn read_model() -> Option<crate::model::Model> {
-    serde_json::from_slice(&fs::read(dir().join("model.json")).ok()?).ok()
-}
-
-pub fn write_model(m: &crate::model::Model) {
-    let _ = write_atomic("model.json", &serde_json::to_vec(m).unwrap());
 }
 
 pub fn read_pins() -> Pins {
@@ -257,4 +246,35 @@ pub fn lock() -> Result<fs::File, String> {
     f.set_len(0).ok();
     let _ = write!(f, "{}", std::process::id());
     Ok(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trace_with_other_columns_is_moved_aside() {
+        let _env = crate::tui::tests::ENV.lock().unwrap();
+        let d = std::env::temp_dir().join(format!("guvnor-trace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        unsafe {
+            std::env::set_var("GUVNOR_STATE", &d);
+        }
+        let old = "time,rpm,target,heat,predicted,hottest\n1,2500,2500,,,\n";
+        fs::write(d.join("trace.csv"), old).unwrap();
+        let s = Sample {
+            t: 5.0,
+            rpm: 2600,
+            ..Sample::default()
+        };
+        append_trace(&s, 2500, true);
+        append_trace(&s, 2500, true);
+        assert_eq!(fs::read_to_string(d.join("trace.1.csv")).unwrap(), old);
+        let new = fs::read_to_string(d.join("trace.csv")).unwrap();
+        assert_eq!(new.lines().count(), 3);
+        assert!(new.starts_with("time,rpm,target,heat,hottest,"));
+        assert!(new.lines().all(|l| l.split(',').count() == 10));
+        fs::remove_dir_all(&d).unwrap();
+    }
 }

@@ -22,35 +22,9 @@ pub struct Config {
     pub temperature: Temperature,
     pub work: Work,
     pub battery: Option<Battery>,
-    pub learn: Learn,
-}
-
-/// The fan model (see `model`): learn how this machine's fans follow its heat, and act on
-/// where they are heading.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Learn {
-    pub mode: LearnMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LearnMode {
-    /// Learn, and once the model predicts well, let the fan rules act on the predicted speed
-    /// when it is higher than the actual one (default).
-    Auto,
-    /// Learn and show the prediction, but act only on the actual fan speed.
-    Record,
-    /// Neither.
-    Off,
-}
-
-impl Default for Learn {
-    fn default() -> Self {
-        Learn {
-            mode: LearnMode::Auto,
-        }
-    }
+    /// The fan model's section, from before it was removed: accepted and ignored.
+    #[serde(rename = "learn")]
+    pub _learn: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -170,7 +144,7 @@ impl Default for Config {
             temperature: Temperature::default(),
             work: Work::default(),
             battery: None,
-            learn: Learn::default(),
+            _learn: None,
         }
     }
 }
@@ -386,16 +360,6 @@ idle_below = 1.0
 # max_duty = 0.5
 # target_rpm = 2500
 # below_charge = 100  # only when the charge is at or below this percentage
-
-[learn]
-# The fans follow the heat being produced, about a minute late. guvnor learns that curve for
-# this machine (from CPU power, or the mean die temperature without a power reading), keeps it
-# in the state directory, and predicts the fans a minute ahead.
-#   "auto":   once it predicts well, the fan rules act on the predicted speed when it is higher,
-#             so the setpoint stops climbing before the fans overshoot
-#   "record": learn and show the prediction only
-#   "off":    neither
-mode = "auto"
 "#;
 
 #[cfg(test)]
@@ -405,6 +369,8 @@ mod tests {
     #[test]
     fn sample_is_the_defaults() {
         assert_eq!(Config::parse(SAMPLE).unwrap(), Config::default());
+        // A config from when there was a fan model still loads.
+        assert!(Config::parse("[learn]\nmode = \"auto\"\n").is_ok());
         assert_eq!(Config::parse("").unwrap(), Config::default());
     }
 
