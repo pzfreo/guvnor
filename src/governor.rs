@@ -3,7 +3,7 @@
 use crate::config::{Config, Control};
 use crate::controller::Controller;
 use crate::log;
-use crate::power::Power;
+use crate::power::{AcGuard, Power};
 use crate::procs::{self, Matcher};
 use crate::smc::Smc;
 use crate::state::{self, Sample};
@@ -194,12 +194,25 @@ impl Ctl {
     }
 }
 
-/// A period's die readings: the hottest, and the sum and count of the means.
+/// A period's die readings (the hottest, and the sum and count of the means) and battery power.
 #[derive(Default)]
 struct Temps {
     max: Option<f64>,
     sum: f64,
     n: u32,
+    /// The power the battery supplies (SMC SBAP), read through each cycle: it swings by tens of
+    /// watts between the run and the pause, so only its mean over the period means anything.
+    battery_sum: f64,
+    battery_n: u32,
+}
+
+impl Temps {
+    fn read_battery(&mut self, smc: &Smc) {
+        if let Some(w) = smc.number(b"SBAP") {
+            self.battery_sum += w;
+            self.battery_n += 1;
+        }
+    }
 }
 
 /// What the loop publishes for `guvnor status` and the dashboard.
@@ -207,12 +220,20 @@ struct Publisher {
     history: VecDeque<Sample>,
     rpm: u32,
     target: u32,
+    /// The ceiling from the config and power source...
     ceiling: f64,
+    /// ...and the cap the AC guard holds the duty under, while the adapter is short.
+    ac_cap: Option<f64>,
     temp: Option<f64>,
     avg: Option<f64>,
 }
 
 impl Publisher {
+    /// The ceiling the work runs under.
+    fn limit(&self) -> f64 {
+        self.ac_cap.map_or(self.ceiling, |c| c.min(self.ceiling))
+    }
+
     /// Takes one cycle's die readings into the latest values and the period's figures.
     fn read(&mut self, (t, avg): (f64, f64), period: &mut Temps) {
         self.temp = Some(t);
@@ -233,7 +254,8 @@ impl Publisher {
                 Ctl::Temp(..) => None,
             },
             target: self.target,
-            ceiling: self.ceiling,
+            ceiling: self.limit(),
+            ac_cap: self.ac_cap,
             period: cfg.period,
             paused: phase == "off",
             phase: phase.into(),
@@ -265,6 +287,10 @@ pub fn run(path: PathBuf) -> Result<(), String> {
     // Anything left paused by an earlier governor that died runs again first.
     let n = continue_all(&matcher);
     let mut power = Power::current();
+    // The power the battery supplies, each period's mean smoothed: on AC it says whether the
+    // adapter keeps up (macOS's "charging" says only that the charger is on).
+    let mut battery_w: Option<f64> = None;
+    let mut guard = AcGuard::default();
     let (target, ceiling) = config.effective(power);
     let rpm = smc.rpm();
     // Finding the sensors lists every SMC key, which takes a second or two: do it before the
@@ -279,6 +305,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         rpm,
         target,
         ceiling,
+        ac_cap: None,
         temp: None,
         avg: None,
     };
@@ -377,12 +404,37 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                     pct(out.ceiling)
                 ));
             }
+            // The battery answers the duty within a cycle: smooth only the bursts of work.
+            if temps.battery_n > 0 {
+                let w = temps.battery_sum / temps.battery_n as f64;
+                let a = 1.0 - (-config.period / 20.0).exp();
+                battery_w = Some(battery_w.map_or(w, |o| o + a * (w - o)));
+            }
+            // With throttling off there is nothing to limit: the guard stands down.
+            let min = config
+                .battery
+                .as_ref()
+                .and_then(|b| b.min_charge_on_ac)
+                .filter(|_| !paused);
+            let duty = ctl.duty().min(out.ceiling);
+            if guard.update(min, power, battery_w, duty, out.ceiling, config.rules.floor) {
+                log(&match guard.cap {
+                    Some(c) => format!(
+                        "adapter short: battery {}% supplying {:.0} W; limiting work, from {}",
+                        power.charge.unwrap_or(0),
+                        battery_w.unwrap_or(0.0),
+                        pct(c)
+                    ),
+                    None => "adapter keeps up: work no longer limited".to_string(),
+                });
+            }
+            out.ac_cap = guard.cap;
             out.rpm = smc.rpm();
             let period_avg = (temps.n > 0)
                 .then(|| temps.sum / temps.n as f64)
                 .or(out.avg);
             if !paused {
-                ctl.outer(out.rpm, out.target, out.ceiling);
+                ctl.outer(out.rpm, out.target, out.limit());
             }
             // The die far above the setpoint with the work already at the floor for a minute:
             // the heat is coming from something guvnor does not throttle. Say so once.
@@ -442,12 +494,13 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             while Instant::now() < end && !STOP.load(Ordering::SeqCst) && state::paused() == paused
             {
                 dog.beat();
+                temps.read_battery(&smc);
                 std::thread::sleep(Duration::from_millis(50));
             }
             let reading = if paused {
                 ctl.peek(&smc)
             } else {
-                ctl.inner(&smc, cycle, out.ceiling)
+                ctl.inner(&smc, cycle, out.limit())
             };
             if let Some(r) = reading {
                 out.read(r, &mut temps);
@@ -557,7 +610,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
             // Read the die once a cycle; without staggering, at the end of the run, its hottest.
             if !read && phase >= duty {
                 read = true;
-                if let Some(r) = ctl.inner(&smc, cycle, out.ceiling) {
+                if let Some(r) = ctl.inner(&smc, cycle, out.limit()) {
                     out.read(r, &mut temps);
                 }
             }
@@ -566,6 +619,7 @@ pub fn run(path: PathBuf) -> Result<(), String> {
                 out.write(&ctl, &config, "pause", cycle * (1.0 - phase));
             }
             dog.beat();
+            temps.read_battery(&smc);
             std::thread::sleep(tick);
         }
         if interrupted {

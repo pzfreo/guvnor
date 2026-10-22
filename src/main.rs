@@ -227,7 +227,11 @@ fn status(c: &config::Config) {
                     (Some(t), Some(sp)) => format!(", die {t:.0} °C{avg} holding {sp:.0} °C"),
                     _ => String::new(),
                 };
-                format!("duty {:.0}%{cap}{die}", s.duty * 100.0)
+                let short = s
+                    .ac_cap
+                    .map(|c| format!(", adapter short: limited to {:.0}%", c * 100.0))
+                    .unwrap_or_default();
+                format!("duty {:.0}%{cap}{die}{short}", s.duty * 100.0)
             };
             println!(
                 "governor: running (pid {}), {state}, target {} rpm, period {} s",
@@ -248,8 +252,24 @@ fn status(c: &config::Config) {
         None => println!("fans: cannot open the SMC"),
     }
     let src = if power.on_battery { "battery" } else { "AC" };
+    // The adapter's delivered power and the battery's (positive while it charges), right now.
+    let smc = smc::Smc::open();
+    let watts = |k: &[u8; 4]| smc.as_ref().and_then(|s| s.number(k));
+    let adapter = watts(b"PDTR")
+        .filter(|_| !power.on_battery)
+        .map(|w| {
+            let of = power::adapter_rating()
+                .map(|r| format!(" of {r}"))
+                .unwrap_or_default();
+            format!(", adapter {w:.0}{of} W")
+        })
+        .unwrap_or_default();
+    let battery = watts(b"SBAP")
+        .filter(|_| power.charge.is_some())
+        .map(|w| format!(", battery {:+.0} W", -w))
+        .unwrap_or_default();
     println!(
-        "power: {src}{}",
+        "power: {src}{}{adapter}{battery}",
         power
             .charge
             .map(|c| format!(", {c}% charged"))

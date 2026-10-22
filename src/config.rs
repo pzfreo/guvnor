@@ -131,6 +131,12 @@ pub struct Battery {
     pub target_rpm: Option<u32>,
     /// Apply only when the charge is at or below this percentage.
     pub below_charge: u32,
+    /// On AC, keep the charge at or above this percentage: at or below it, while the battery
+    /// supplies power (the adapter cannot keep up with the load), the work is limited to what
+    /// the adapter sustains (see `power::AcGuard`). The limits above are for battery only.
+    /// macOS's own holds (optimised charging, the charge limit) stop at 80% or more, so keep
+    /// this below 80.
+    pub min_charge_on_ac: Option<u32>,
 }
 
 impl Default for Config {
@@ -192,6 +198,7 @@ impl Default for Battery {
             max_duty: None,
             target_rpm: None,
             below_charge: 100,
+            min_charge_on_ac: None,
         }
     }
 }
@@ -266,6 +273,9 @@ impl Config {
         )?;
         if let Some(d) = self.battery.as_ref().and_then(|b| b.max_duty) {
             check(d > 0.0 && d <= 1.0, "battery.max_duty must be in (0, 1]")?;
+        }
+        if let Some(m) = self.battery.as_ref().and_then(|b| b.min_charge_on_ac) {
+            check(m <= 100, "battery.min_charge_on_ac must be a percentage")?;
         }
         let w = &self.work;
         for p in w
@@ -360,6 +370,7 @@ idle_below = 1.0
 # max_duty = 0.5
 # target_rpm = 2500
 # below_charge = 100  # only when the charge is at or below this percentage
+# min_charge_on_ac = 50  # on AC: below this, limit work to what the adapter can sustain
 "#;
 
 #[cfg(test)]
@@ -390,24 +401,18 @@ mod tests {
     fn battery_profile_applies_only_on_battery_below_the_charge() {
         let c =
             Config::parse("[battery]\nmax_duty = 0.5\ntarget_rpm = 0\nbelow_charge = 50").unwrap();
-        let ac = Power {
-            on_battery: false,
-            charge: Some(20),
+        let p = |on_battery, charge| Power {
+            on_battery,
+            charge: Some(charge),
         };
-        assert_eq!(c.effective(ac), (2500, 1.0));
-        assert_eq!(
-            c.effective(Power {
-                on_battery: true,
-                charge: Some(80)
-            }),
-            (2500, 1.0)
-        );
-        assert_eq!(
-            c.effective(Power {
-                on_battery: true,
-                charge: Some(40)
-            }),
-            (0, 0.5)
-        );
+        assert_eq!(c.effective(p(false, 20)), (2500, 1.0));
+        assert_eq!(c.effective(p(true, 80)), (2500, 1.0));
+        assert_eq!(c.effective(p(true, 40)), (0, 0.5));
+    }
+
+    #[test]
+    fn min_charge_on_ac_is_a_percentage() {
+        assert!(Config::parse("[battery]\nmin_charge_on_ac = 50").is_ok());
+        assert!(Config::parse("[battery]\nmin_charge_on_ac = 101").is_err());
     }
 }

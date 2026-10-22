@@ -78,6 +78,9 @@ pub struct Status {
     pub cap: Option<f64>,
     pub target: u32,
     pub ceiling: f64,
+    /// On AC, the cap on the duty while the adapter cannot hold `min_charge_on_ac`.
+    #[serde(default)]
+    pub ac_cap: Option<f64>,
     pub period: f64,
     pub paused: bool,
     /// "run" or "pause" within a synchronised cycle, "stagger" with staggered pauses, "full" at

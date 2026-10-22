@@ -35,6 +35,9 @@ IOKit and only signals your own processes.
 Run `guvnor` with no command in a terminal (like `htop` or `lazygit`); piped or scripted, it prints
 `status` instead. It shows:
 
+- in the header, the power source and charge; on AC, the power the adapter delivers against its
+  rating; the battery's power (+ charging, − supplying, amber when it drains on AC); the AC
+  battery minimum (`keep ≥ 50%`), and, while the adapter is short, the limit on the work;
 - each fan spinning at a speed that follows its rpm, on a bar with the target marked, coloured by
   zone: off, base, high, LIMIT;
 - how much the work is allowed to run (the duty), and one line saying why: the die temperature
@@ -67,7 +70,7 @@ Keys:
     `sheets-[0-9a-f]{16}`.
   - **off**: removes that rule, or, if another rule still catches the process, adds it to
     `exclude_names`.
-- `t` turns throttling off (all work runs freely) or on again; `+` / `-` move the target by 100 rpm; `q` quits.
+- `t` turns throttling off (all work runs freely) or on again; `+` / `-` move the target by 100 rpm; `[` / `]` move the battery minimum on AC (`min_charge_on_ac`) by 5% (from off it starts at 50%, it stays at or below 75%, and below 10% it is off); `e` edits the config in nano (starting from the commented defaults when there is none; on return it says whether the config is valid, since the governor ignores a broken one); `q` quits.
 
 Config changes keep the file's comments, and the governor applies them within a period. With no
 governor running the dashboard still shows the fans and your processes.
@@ -105,7 +108,16 @@ an error. `guvnor config` prints them all with comments. In short:
   (search in the whole command line, like `pgrep -f`), `tree_names` / `tree_cmdlines` (that process
   and all its descendants), `exclude_names` (never, whatever else matches), and `idle_below` (1: work using less than 1% of a core over the last 10 s, counting only the time it was let run, is left running, since pausing it saves no heat; a new process is judged by its average since it started; 0 pauses all work). `guvnor config`
   shows examples for Rust, C/C++, Python and media tools.
-- `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`.
+- `[battery]` (off unless present): `max_duty`, `target_rpm`, `below_charge`, and
+  `min_charge_on_ac` (off): on AC, the charge to keep. When the adapter cannot keep up with the
+  load (a 65 W charger on a machine that draws more), the battery makes up the difference even
+  while plugged in. At or below this charge, while the battery supplies over a watt, guvnor caps
+  the work's duty and finds the most the adapter sustains: each period it cuts the cap 5% while
+  the battery still drains, and raises it 2% while it charges at over 3 W or is above the
+  minimum, letting go once the cap is back at the ceiling. The battery's power is the SMC's
+  `SBAP`, smoothed over 20 s (macOS's "charging" only says that the charger is on). The limits
+  above stay for battery only. macOS's own holds (optimised charging, the charge limit) stop at
+  80% or more, so keep this below 80.
 
 Each period is appended to `trace.csv` in the state directory (about 0.5 MB a day; past 8 MB it
 moves to `trace.1.csv`): time, fan speed, target, CPU power (`PSTR`), hottest and mean die

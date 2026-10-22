@@ -102,6 +102,10 @@ struct App {
     fans: Vec<(f64, f64)>,
     spin: Vec<f64>,
     power: Power,
+    /// The adapter's rating, and the power it delivers and the battery takes (negative when
+    /// it supplies), smoothed, in watts.
+    rating: Option<u32>,
+    watts: (Option<f64>, Option<f64>),
     status: Option<Status>,
     /// Every process guvnor could control, with its CPU.
     work: Vec<Work>,
@@ -130,6 +134,8 @@ impl App {
             fans: vec![],
             spin: vec![],
             power: Power::default(),
+            rating: None,
+            watts: (None, None),
             status: None,
             work: vec![],
             items: vec![],
@@ -166,6 +172,17 @@ impl App {
     fn refresh_fast(&mut self) {
         if let Some(smc) = &self.smc {
             self.fans = smc.fans();
+            // PDTR: delivered by the adapter; SBAP: drawn from the battery. They swing with
+            // each burst of work, so smooth them over a few seconds.
+            let a = 1.0 - (-0.5f64 / 5.0).exp();
+            let ema = |old: Option<f64>, new: Option<f64>| match (old, new) {
+                (Some(o), Some(n)) => Some(o + a * (n - o)),
+                (_, n) => n,
+            };
+            self.watts = (
+                ema(self.watts.0, smc.number(b"PDTR")),
+                ema(self.watts.1, smc.number(b"SBAP").map(|w| -w)),
+            );
         }
         self.spin.resize(self.fans.len(), 0.0);
         // Paused or running changes twice a period; refresh it more often than the CPU figures.
@@ -202,6 +219,7 @@ impl App {
             Err(e) => self.config_error = Some(e),
         }
         self.power = Power::current();
+        self.rating = crate::power::adapter_rating();
         let elapsed = self.cpu_at.elapsed().as_nanos().max(1) as f64;
         self.cpu_at = Instant::now();
         let mut prev = std::mem::take(&mut self.cpu_prev);
@@ -347,6 +365,55 @@ impl App {
             Err(e) => self.say(format!("error: {e}")),
         }
     }
+
+    fn nudge_min_charge(&mut self, delta: i64) {
+        match set_min_charge(&config::default_path(), delta) {
+            Ok(min) => {
+                self.say(match min {
+                    Some(m) => format!("on AC, keep the battery at {m}% or more"),
+                    None => "on AC, no battery minimum".into(),
+                });
+                self.refresh_slow();
+            }
+            Err(e) => self.say(format!("error: {e}")),
+        }
+    }
+}
+
+/// Moves [battery] min_charge_on_ac in the config by `delta` percent: from off it starts at 50,
+/// it stays at or below 75 (macOS's own holds are at 80 or more), and below 10 it is off.
+fn set_min_charge(path: &std::path::Path, delta: i64) -> Result<Option<u32>, String> {
+    let mut min = None;
+    edit_config(path, |doc| {
+        let current = doc
+            .get("battery")
+            .and_then(|b| b.get("min_charge_on_ac"))
+            .and_then(|v| v.as_integer());
+        let new = match current {
+            None => 50,
+            Some(c) => (c + delta).min(75),
+        };
+        if new < 10 {
+            if let Some(b) = doc.get_mut("battery").and_then(|b| b.as_table_like_mut()) {
+                b.remove("min_charge_on_ac");
+            }
+            return Ok(());
+        }
+        min = Some(new as u32);
+        let battery = doc
+            .entry("battery")
+            .or_insert(toml_edit::table())
+            .as_table_like_mut()
+            .ok_or("[battery] is not a table")?;
+        match battery.get_mut("min_charge_on_ac") {
+            Some(item) => set_value(item, new.into()),
+            None => {
+                battery.insert("min_charge_on_ac", toml_edit::value(new));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(min)
 }
 
 /// Edits the config file with toml_edit, keeping its comments and layout, and writes it only
@@ -759,6 +826,40 @@ pub fn run() -> Result<(), String> {
     result
 }
 
+/// Leaves the dashboard for nano on the config file (the commented defaults when there is
+/// none), then comes back and says whether what was saved is valid: the governor ignores a
+/// broken config and keeps its settings.
+fn edit_in_nano(terminal: &mut DefaultTerminal, app: &mut App) -> DefaultTerminal {
+    let path = config::default_path();
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, config::SAMPLE);
+    }
+    let _ = terminal.flush();
+    ratatui::restore();
+    let ran = std::process::Command::new("nano").arg(&path).status();
+    let mut fresh = ratatui::init();
+    let _ = fresh.clear();
+    match (ran, Config::load(&path)) {
+        (Err(e), _) => app.say(format!("error: cannot run nano: {e}")),
+        (Ok(_), Err(e)) => app.say(format!(
+            "config error, the governor keeps its settings: {e}"
+        )),
+        (Ok(_), Ok(_)) => app.say(format!(
+            "config saved{}",
+            if app.status.is_some() {
+                format!("; applies within {} s", app.config.period)
+            } else {
+                String::new()
+            }
+        )),
+    }
+    app.refresh_slow();
+    fresh
+}
+
 fn event_loop(terminal: &mut DefaultTerminal) -> Result<(), String> {
     let mut app = App::new();
     let (mut fast, mut slow, mut last) = (Instant::now(), Instant::now(), Instant::now());
@@ -776,6 +877,11 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<(), String> {
                 KeyCode::Char('t') | KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
                 KeyCode::Char('+') | KeyCode::Char('=') => app.nudge_target(100),
                 KeyCode::Char('-') => app.nudge_target(-100),
+                KeyCode::Char(']') => app.nudge_min_charge(5),
+                KeyCode::Char('[') => app.nudge_min_charge(-5),
+                KeyCode::Char('e') => {
+                    *terminal = edit_in_nano(terminal, &mut app);
+                }
                 KeyCode::Up | KeyCode::Char('k') => app.select(-1),
                 KeyCode::Down | KeyCode::Char('j') => app.select(1),
                 KeyCode::Right | KeyCode::Char('l') => app.open(true),
@@ -893,6 +999,52 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(format!("  ·  {power}"), Style::new().fg(DIM)),
     ];
+    if let (false, Some(w)) = (app.power.on_battery, app.watts.0) {
+        let of = app.rating.map(|r| format!(" of {r}")).unwrap_or_default();
+        spans.push(Span::styled(
+            format!("  ·  adapter {w:.0}{of} W"),
+            Style::new().fg(DIM),
+        ));
+    }
+    if let Some(w) = app.watts.1.filter(|_| app.power.charge.is_some()) {
+        // Draining on AC: the adapter is not enough.
+        let color = if w < -0.5 && !app.power.on_battery {
+            WARN
+        } else {
+            DIM
+        };
+        spans.push(Span::styled(
+            format!("  ·  battery {w:+.0} W"),
+            Style::new().fg(color),
+        ));
+    }
+    if let Some(m) = app.config.battery.as_ref().and_then(|b| b.min_charge_on_ac) {
+        spans.push(Span::styled(
+            format!("  ·  keep ≥ {m}%"),
+            Style::new().fg(DIM),
+        ));
+    }
+    if let Some(c) = app.status.as_ref().and_then(|s| s.ac_cap) {
+        spans.push(Span::styled(
+            format!("  adapter short: work limited to {:.0}%", c * 100.0),
+            Style::new().fg(WARN),
+        ));
+    } else if let (Some(m), Some(c), Some(w), Some(s)) = (
+        app.config.battery.as_ref().and_then(|b| b.min_charge_on_ac),
+        app.power.charge,
+        app.watts.1,
+        &app.status,
+    ) && s.paused
+        && !app.power.on_battery
+        && c <= m
+        && w < -1.0
+    {
+        // The guard stands down while throttling is off: say why the battery is falling.
+        spans.push(Span::styled(
+            "  below the minimum, but throttling is off",
+            Style::new().fg(WARN),
+        ));
+    }
     if let Some(s) = &app.status {
         spans.push(Span::styled(
             format!("  ·  pid {}  ·  period {} s", s.pid, s.period),
@@ -1553,6 +1705,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(pause),
         key("+/-"),
         Span::raw(" target  "),
+        key("[/]"),
+        Span::raw(" battery minimum  "),
+        key("e"),
+        Span::raw(" edit config  "),
         key("q"),
         Span::raw(" quit  "),
     ];
@@ -1582,6 +1738,37 @@ pub(crate) mod tests {
         assert!(text.contains("target_rpm = 2600") && text.contains("# keep the fastest fan"));
         assert_eq!(set_target(&path, -300).unwrap(), 2300);
         assert_eq!(Config::load(&path).unwrap().target_rpm, 2300);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn min_charge_starts_at_50_stays_below_80_and_turns_off() {
+        let dir = std::env::temp_dir().join(format!("guvnor-charge-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        let min = |c: &Config| c.battery.as_ref().and_then(|b| b.min_charge_on_ac);
+        // From the sample: starts at 50, and sets nothing else.
+        assert_eq!(set_min_charge(&path, 5).unwrap(), Some(50));
+        let c = Config::load(&path).unwrap();
+        assert_eq!(
+            (min(&c), c.battery.as_ref().unwrap().max_duty),
+            (Some(50), None)
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("# keep the fastest fan")
+        );
+        for _ in 0..10 {
+            set_min_charge(&path, 5).unwrap();
+        }
+        assert_eq!(set_min_charge(&path, 5).unwrap(), Some(75));
+        // Down past 10: off.
+        for _ in 0..13 {
+            set_min_charge(&path, -5).unwrap();
+        }
+        assert_eq!(set_min_charge(&path, -5).unwrap(), None);
+        assert_eq!(min(&Config::load(&path).unwrap()), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
